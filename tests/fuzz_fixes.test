@@ -1,0 +1,126 @@
+package require tcltest 2
+namespace eval ::fuzzFixes {
+    namespace import ::tcltest::*
+    variable project [file dirname [file dirname [file normalize [info script]]]]
+    source [file join $project tests fuzz.tcl]
+    source [file join $project lib manager.tcl]
+    variable host [info nameofexecutable]
+    variable cli [file join $project tclvenv.tcl]
+    variable root [makeDirectory "fuzz-fixes-[pid]"]
+    testConstraint unix [expr {$::tcl_platform(platform) eq "unix"}]
+
+    # These cases failed before the fixes. Assertions remain in the independent
+    # fuzz oracles, including protected external trees and native Tcl behavior.
+    foreach {group index} {
+        containment 2 containment 3 containment 7 containment 8
+        ownership 0 ownership 1 ownership 2 ownership 6
+        interleavings 0 interleavings 8 interleavings 21
+        modulegrammar 0 modulegrammar 5 modulegrammar 13
+        completions 55 completions 14 completions 36 completions 17 completions 35
+        faults 0 faults 1 faults 2 faults 3 faults 7 faults 9 faults 12 faults 13
+    } {
+        set constraints {}
+        if {$group in {containment interleavings modulegrammar}} { set constraints unix }
+        test fuzz-fixed-1.$group-$index {previously failing fuzz input preserves data and satisfies its contract} -constraints $constraints -body {
+            set report [file join $root $group-$index]
+            set result [::fuzz::run [list $host [file join $project tests fuzz.tcl] \
+                --seed 1 --only $group --case $index --report-dir $report] \
+                [file join $root runner-$group-$index]]
+            set summary [::fuzz::readData [file join $report summary.tcldata]]
+            list [dict get $result status] [dict get $summary total] [dict get $summary failed] \
+                [dict get $summary timeouts] [dict get $summary output_limits]
+        } -result {0 1 0 0 0}
+    }
+
+    variable envdir [file join $root env]
+    exec -- $host $cli create $envdir
+    set scripts [list \
+        return-level {return -level 2 marker} \
+        custom-code {return -code 7 marker} \
+        custom-return {return -code 2 -level 1 marker} \
+        nested {proc nested {} {return -level 3 marker}; nested}]
+    foreach {name body} $scripts {
+        foreach entry {runtime manager launcher} {
+            set constraints {}
+            if {$entry eq "launcher"} { set constraints unix }
+            test script-completion-2.$name-$entry {reduced script failures match native Tcl on every entry point} -constraints $constraints -body {
+                set script [file join $root reduced.tcl]
+                ::fuzz::writeText $script $body
+                set native [::fuzz::run [list $host $script] [file join $root native-$name-$entry]]
+                switch -- $entry {
+                    runtime { set command [list $host [file join $envdir metadata runtime.tcl] $script] }
+                    manager { set command [list $host $cli run $envdir -- $script] }
+                    launcher { set command [list [file join $envdir bin tclsh] $script] }
+                }
+                set actual [::fuzz::run $command [file join $root actual-$name-$entry]]
+                list [dict get $native status] [dict get $actual status] \
+                    [expr {[dict get $actual output] eq [dict get $native output]}] \
+                    [expr {[::fuzz::completionDiagnostic [dict get $actual stderr]] eq \
+                        [::fuzz::completionDiagnostic [dict get $native stderr]]}]
+            } -result {1 1 1 1}
+        }
+    }
+
+    foreach entry {runtime manager launcher} {
+        set constraints {}
+        if {$entry eq "launcher"} { set constraints unix }
+        test script-globals-3.$entry {completion handling does not write application globals or trigger their traces} -constraints $constraints -body {
+            set script [file join $root globals.tcl]
+            ::fuzz::writeText $script {
+                proc rejectWrite {args} { error {framework wrote application state} }
+                foreach name {message options completion} {
+                    set $name application-value
+                    trace add variable $name write rejectWrite
+                }
+                puts intact
+            }
+            set native [::fuzz::run [list $host $script] [file join $root native-globals-$entry]]
+            switch -- $entry {
+                runtime { set command [list $host [file join $envdir metadata runtime.tcl] $script] }
+                manager { set command [list $host $cli run $envdir -- $script] }
+                launcher { set command [list [file join $envdir bin tclsh] $script] }
+            }
+            set actual [::fuzz::run $command [file join $root actual-globals-$entry]]
+            list [dict get $native status] [dict get $actual status] \
+                [expr {[dict get $actual output] eq "intact\n"}] [dict get $actual stderr]
+        } -result {0 0 1 {}}
+    }
+
+    test removal-plan-4.changed {a recorded file changed at the deletion boundary is retained and retryable} -setup {
+        set source [file join $root planned]
+        file mkdir $source
+        ::fuzz::writeText [file join $source pkgIndex.tcl] {}
+        ::fuzz::writeText [file join $source data] original
+        exec -- $host $cli install $envdir $source
+        rename ::tclvenv::deleteOwned ::tclvenv::__fixedSavedDelete
+        proc ::tclvenv::deleteOwned {path} {
+            if {[file tail $path] eq "payload"} {
+                ::fuzz::writeText [file join $path data] concurrent-change
+            }
+            ::tclvenv::__fixedSavedDelete $path
+        }
+    } -body {
+        set code [catch {::tclvenv::remove $envdir planned} message]
+        rename ::tclvenv::deleteOwned {}
+        rename ::tclvenv::__fixedSavedDelete ::tclvenv::deleteOwned
+        set receipt [dict get [::tclvenv::installed $envdir] planned]
+        set stage [file join $envdir metadata [dict get $receipt stage]]
+        set before [list $code [string match {*staged file changed*} $message] \
+            [dict get $receipt state] [::fuzz::readBytes [file join $stage payload data]] \
+            [::fuzz::readBytes [file join $source data]]]
+        ::fuzz::writeText [file join $stage payload data] original
+        exec -- $host $cli remove $envdir planned
+        concat $before [list [file exists $stage] \
+            [dict exists [::tclvenv::installed $envdir] planned] \
+            $::tclvenv::deletionRoot $::tclvenv::deletionParents]
+    } -cleanup {
+        if {[llength [info commands ::tclvenv::__fixedSavedDelete]]} {
+            rename ::tclvenv::deleteOwned {}
+            rename ::tclvenv::__fixedSavedDelete ::tclvenv::deleteOwned
+        }
+    } -result {1 1 removing concurrent-change original 0 0 {} {}}
+
+    ::fuzz::cleanup $root
+    removeDirectory $root
+    cleanupTests
+}

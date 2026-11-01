@@ -1,0 +1,248 @@
+package require tcltest 2
+namespace eval ::fuzzRegression {
+    namespace import ::tcltest::*
+    variable project [file dirname [file dirname [file normalize [info script]]]]
+    source [file join $project lib manager.tcl]
+    variable host [info nameofexecutable]
+    variable cli [file join $project tclvenv.tcl]
+    variable work [makeDirectory "fuzz-regressions-[pid]"]
+    testConstraint unix [expr {$::tcl_platform(platform) eq "unix"}]
+
+    proc put {path text} {
+        set ch [open $path w]
+        try {
+            fconfigure $ch -encoding utf-8 -translation lf
+            puts -nonewline $ch $text
+        } finally { close $ch }
+    }
+    proc manager {args} {
+        variable host
+        variable cli
+        exec -- $host $cli {*}$args
+    }
+    proc fixture {name {tail env} {system 0}} {
+        variable work
+        variable root [file join $work $name]
+        variable envdir [file join $root $tail]
+        variable manifest [file join $envdir metadata installed.tcldata]
+        variable script [file join $root app.tcl]
+        file mkdir $root
+        set arguments [list create $envdir --tcl [info nameofexecutable]]
+        if {$system} { lappend arguments --system-packages }
+        manager {*}$arguments
+    }
+    proc install {} {
+        variable root
+        variable envdir
+        variable source [file join $root localpkg]
+        file mkdir [file join $source empty]
+        put [file join $source pkgIndex.tcl] {}
+        put [file join $source data] unchanged
+        manager install $envdir $source
+    }
+    proc pending {} {
+        variable envdir
+        variable manifest
+        variable receipt [dict get [::tclvenv::readData $manifest] localpkg]
+        variable stage [::tclvenv::makeStage $envdir remove]
+        variable journal [file join $stage transaction.tcldata]
+        ::tclvenv::writeData $journal $receipt
+        file rename -- [file join $envdir lib localpkg] [file join $stage payload]
+        dict set receipt state removing
+        dict set receipt stage [file tail $stage]
+        ::tclvenv::writeData $manifest [dict create localpkg $receipt]
+    }
+    proc reverse {data} {
+        set result {}
+        foreach key [lreverse [dict keys $data]] { dict set result $key [dict get $data $key] }
+        return $result
+    }
+    proc cleanup {} {
+        variable root
+        ::tclvenv::deleteOwned $root
+    }
+
+    test fuzz-removal-1.forged {a forged removal receipt preserves unrelated staging files and the installed package} -setup {
+        fixture forged
+        install
+        set stage [file join $envdir metadata remove-unrelated]
+        file mkdir $stage
+        put [file join $stage precious] unrelated
+        set receipt [dict get [::tclvenv::readData $manifest] localpkg]
+        dict set receipt state removing
+        dict set receipt stage remove-unrelated
+        ::tclvenv::writeData $manifest [dict create localpkg $receipt]
+        set before [::tclvenv::inventory $envdir]
+    } -body {
+        set code [catch {manager remove $envdir localpkg} message]
+        list $code [string match {*missing or invalid removal journal*} $message] \
+            [::tclvenv::sameInventory $before [::tclvenv::inventory $envdir]]
+    } -cleanup { cleanup } -result {1 1 1}
+
+    foreach mutation {missing malformed target source files state stage extra-field missing-field extra-file} {
+        test fuzz-removal-2.$mutation {invalid pending-removal journals preserve the entire environment} -setup {
+            fixture journal-$mutation
+            install
+            pending
+            set original [::tclvenv::readData $journal]
+            switch -- $mutation {
+                missing { file delete -- $journal }
+                malformed { put $journal "\{" }
+                target { dict set original target lib/someone-else }
+                source { dict set original source elsewhere }
+                files { dict set original files data size 999 }
+                state { dict set original state removing }
+                stage { dict set original stage remove-other }
+                extra-field { dict set original extra unexpected }
+                missing-field { dict unset original source }
+                extra-file { put [file join $stage precious] unrelated }
+            }
+            if {$mutation ni {missing malformed}} { ::tclvenv::writeData $journal $original }
+            set before [::tclvenv::inventory $envdir]
+        } -body {
+            list [catch {manager remove $envdir localpkg}] \
+                [::tclvenv::sameInventory $before [::tclvenv::inventory $envdir]]
+        } -cleanup { cleanup } -result {1 1}
+    }
+
+    test fuzz-removal-3.symlink {a symlink is not accepted as a removal journal} -constraints unix -setup {
+        fixture journal-link
+        install
+        pending
+        set savedJournal [file join $root saved-journal]
+        file rename -- $journal $savedJournal
+        file link -symbolic $journal $savedJournal
+        set before [::tclvenv::fileInfo $savedJournal]
+    } -body {
+        set code [catch {manager remove $envdir localpkg} message]
+        list $code [string match {*missing or invalid removal journal*} $message] \
+            [file type $journal] [file isfile [file join $stage payload data]] \
+            [expr {$before eq [::tclvenv::fileInfo $savedJournal]}] \
+            [dict exists [::tclvenv::readData $manifest] localpkg]
+    } -cleanup { cleanup } -result {1 1 link 1 1 1}
+
+    foreach legacy {0 1} {
+        test fuzz-removal-4.$legacy {matching journals accept reordered dictionaries and legacy receipts without state} -setup {
+            fixture matching-$legacy
+            install
+            if {$legacy} {
+                set records [::tclvenv::readData $manifest]
+                dict unset records localpkg state
+                ::tclvenv::writeData $manifest $records
+            }
+            pending
+            set original [reverse [::tclvenv::readData $journal]]
+            set files {}
+            dict for {path info} [reverse [dict get $original files]] {
+                dict set files $path [reverse $info]
+            }
+            dict set original files $files
+            ::tclvenv::writeData $journal $original
+        } -body {
+            manager remove $envdir localpkg
+            list [dict exists [::tclvenv::readData $manifest] localpkg] [file exists $stage] \
+                [::tclvenv::sameInventory [::tclvenv::inventory $source] \
+                    [dict get $receipt files]]
+        } -cleanup { cleanup } -result {0 0 1}
+    }
+
+    test fuzz-removal-5.late-file {a file added during payload deletion is preserved by nonrecursive staging cleanup} -setup {
+        fixture late-stage-file
+        install
+        pending
+        rename ::tclvenv::deleteOwned ::tclvenv::__fuzzSavedDelete
+        proc ::tclvenv::deleteOwned {path} {
+            ::tclvenv::__fuzzSavedDelete $path
+            if {$path eq [file join $::fuzzRegression::stage payload]} {
+                ::fuzzRegression::put [file join $::fuzzRegression::stage precious] unrelated
+            }
+        }
+    } -body {
+        # The removal is committed before the stage is tidied: the leftover
+        # is a warning (doctor and recover report it), not a failed removal.
+        set code [catch {::tclvenv::remove $envdir localpkg}]
+        list $code [file isfile [file join $stage precious]] \
+            [dict exists [::tclvenv::readData $manifest] localpkg]
+    } -cleanup {
+        rename ::tclvenv::deleteOwned {}
+        rename ::tclvenv::__fuzzSavedDelete ::tclvenv::deleteOwned
+        cleanup
+    } -output "Removed localpkg\n" -errorOutput "tclvenv: warning: couldn't remove the staging directory *\n" \
+        -match glob -result {0 1 0}
+
+    test fuzz-identity-6.reordered {doctor and startup accept the same runtime identity with reordered fields} -setup {
+        fixture reordered-runtime
+        set path [file join $envdir tclvenv.cfg]
+        set cfg [::tclvenv::config $envdir]
+        dict set cfg runtime [reverse [dict get $cfg runtime]]
+        ::tclvenv::writeData $path $cfg
+        put $script {puts ready}
+    } -body {
+        list [string match {*Runtime and installed files: OK*} [manager doctor $envdir]] \
+            [manager run $envdir -- $script]
+    } -cleanup { cleanup } -result {1 ready}
+
+    foreach mutation {changed missing extra} {
+        test fuzz-identity-7.$mutation {doctor still rejects changed runtime fields and mismatched schemas} -setup {
+            fixture identity-$mutation
+            set cfg [::tclvenv::config $envdir]
+            switch -- $mutation {
+                changed { dict set cfg runtime version 0.0 }
+                missing { dict unset cfg runtime machine }
+                extra { dict set cfg runtime unexpected value }
+            }
+            ::tclvenv::writeData [file join $envdir tclvenv.cfg] $cfg
+        } -body {
+            set code [catch {manager doctor $envdir} message]
+            list $code [string match {*Tcl runtime changed*} $message]
+        } -cleanup { cleanup } -result {1 1}
+    }
+
+    set pathIndex 0
+    foreach tail {{environment-é;*["-x} {environment-*[Z0|-x} {environment-?[]\*}} {
+        foreach system {0 1} {
+            incr pathIndex
+            test fuzz-path-8.$pathIndex {literal glob characters in environment names support modules and diagnostics} -constraints unix -setup {
+                fixture path-$pathIndex $tail $system
+                set module [file join $root literaltest-1.0.tm]
+                put $module {package provide literaltest 1.0}
+                manager install $envdir $module
+                put $script {
+                    puts [package require literaltest]
+                    puts [package require msgcat]
+                    puts [expr {[file join $env(TCLVENV) modules] in [::tcl::tm::path list]}]
+                }
+            } -body {
+                set direct [exec -- $host [file join $envdir metadata runtime.tcl] $script]
+                list [lindex $direct 0] [package vsatisfies [lindex $direct 1] 1.0-] \
+                    [lindex $direct 2] [expr {[manager run $envdir -- $script] eq $direct}] \
+                    [expr {[exec -- [file join $envdir bin tclsh] $script] eq $direct}] \
+                    [string match {*Runtime and installed files: OK*} [manager doctor $envdir]]
+            } -cleanup { cleanup } -result {1.0 1 1 1 1 1}
+        }
+    }
+
+    set ancestryIndex 0
+    foreach tail {{environment-*["-x} {environment-[ab]} {environment-\literal}} {
+        incr ancestryIndex
+        test fuzz-path-9.$ancestryIndex {literal module-path validation rejects actual ancestors and descendants} -constraints unix -setup {
+            fixture actual-ancestry-$ancestryIndex $tail
+            put $script {
+                set base [file join $env(TCLVENV) modules]
+                foreach path [list $env(TCLVENV) [file join $base nested]] {
+                    set before [::tcl::tm::path list]
+                    puts [catch {::tclvenv::runtime::addModulePath $path}]
+                    puts [expr {$before eq [::tcl::tm::path list]}]
+                }
+                ::tclvenv::runtime::addModulePath $base
+                puts [expr {[llength [::tcl::tm::path list]] == 2}]
+            }
+        } -body {
+            manager run $envdir -- $script
+        } -cleanup { cleanup } -result "1\n1\n1\n1\n1"
+    }
+
+    ::tclvenv::deleteOwned $work
+    removeDirectory $work
+    cleanupTests
+}

@@ -1,0 +1,189 @@
+package require tcltest 2
+namespace eval ::validation {
+    namespace import ::tcltest::*
+    variable project [file dirname [file dirname [file normalize [info script]]]]
+    source [file join $project lib manager.tcl]
+    variable host [info nameofexecutable]
+    variable cli [file join $project tclvenv.tcl]
+    variable work [makeDirectory "validation-[pid]"]
+
+    proc putFile {path text} {
+        set ch [open $path w]
+        try {
+            fconfigure $ch -encoding utf-8 -translation lf
+            puts -nonewline $ch $text
+        } finally { close $ch }
+        return $path
+    }
+    proc getFile {path} {
+        set ch [open $path r]
+        try { read $ch } finally { close $ch }
+    }
+    proc manager {args} {
+        variable host
+        variable cli
+        exec -- $host $cli {*}$args
+    }
+    proc fixture {name} {
+        variable work
+        variable root [file join $work $name]
+        variable envdir [file join $root env]
+        variable outside [file join $root global]
+        variable marker [file join $root executed]
+        variable app [file join $root app.tcl]
+        variable config
+        variable launcher [file join $envdir bin tclsh]
+        if {$::tcl_platform(platform) eq "windows"} { append launcher .cmd }
+        file mkdir $outside
+        putFile [file join $outside pkgIndex.tcl] {
+            package ifneeded leaked 1.0 {package provide leaked 1.0}
+        }
+        putFile $app {
+            set ch [open [lindex $argv 0] w]
+            puts $ch executed
+            close $ch
+            puts [package require leaked]
+        }
+        manager create $envdir --tcl [info nameofexecutable]
+        set config [::tclvenv::config $envdir]
+    }
+    proc cleanup {} {
+        variable root
+        if {[info exists root]} { ::tclvenv::deleteOwned $root }
+    }
+    proc restoreEnv {saved} {
+        foreach key [array names ::env] {
+            if {![dict exists $saved $key]} { unset ::env($key) }
+        }
+        dict for {key value} $saved { set ::env($key) $value }
+    }
+    proc reverseDictionary {data} {
+        set result {}
+        foreach key [lreverse [dict keys $data]] {
+            dict set result $key [dict get $data $key]
+        }
+        return $result
+    }
+
+    set index 0
+    foreach value {2 -1 0.5 {} invalid {0 1}} {
+        incr index
+        test config-invalid-7.$index {invalid boolean config is rejected before application execution by every entry point} -setup {
+            set savedEnv [array get ::env]
+            fixture invalid-$index
+            dict set config system_packages $value
+            ::tclvenv::writeData [file join $envdir tclvenv.cfg] $config
+            set ::env(TCLLIBPATH) [list $outside]
+        } -body {
+            set commands [list \
+                [list $host $cli info $envdir] \
+                [list $host $cli run $envdir -- $app $marker] \
+                [list $host [file join $envdir metadata runtime.tcl] $app $marker] \
+                [list $launcher $app $marker]]
+            set results {}
+            foreach command $commands {
+                set failed [catch {exec -- {*}$command} result options]
+                set status -1
+                if {$failed && [dict exists $options -errorcode] &&
+                    [lindex [dict get $options -errorcode] 0] eq "CHILDSTATUS"} {
+                    set status [lindex [dict get $options -errorcode] 2]
+                }
+                lappend results [list $status [string match {*invalid system_packages setting*} $result] \
+                    [file exists $marker]]
+            }
+            set results
+        } -cleanup {
+            restoreEnv $savedEnv
+            cleanup
+        } -result {{1 1 0} {1 1 0} {1 1 0} {1 1 0}}
+    }
+
+    set index 0
+    foreach value {0 false no off 1 true yes on} {
+        incr index
+        set expected [expr {$value ? 0 : 1}]
+        test config-valid-8.$index {valid boolean spellings retain the intended isolation behavior} -setup {
+            set savedEnv [array get ::env]
+            fixture valid-$index
+            dict set config system_packages $value
+            ::tclvenv::writeData [file join $envdir tclvenv.cfg] $config
+            set ::env(TCLLIBPATH) [list $outside]
+            putFile $app {puts [catch {package require leaked}]}
+        } -body {
+            list [string is boolean -strict [dict get [::tclvenv::config $envdir] system_packages]] \
+                [manager run $envdir -- $app] \
+                [exec -- $host [file join $envdir metadata runtime.tcl] $app] \
+                [exec -- $launcher $app]
+        } -cleanup {
+            restoreEnv $savedEnv
+            cleanup
+        } -result [list 1 $expected $expected $expected]
+    }
+
+    set expectedInventory [dict create {} [dict create type directory] \
+        data [dict create type file size 3 crc32 12345678]]
+    set reordered [dict create data [dict create crc32 12345678 size 3 type file] \
+        {} [dict create type directory]]
+    set subset [dict create data [dict create crc32 12345678 type file size 3]]
+    set extra $reordered
+    dict set extra unexpected [dict create type directory]
+    set badSize $reordered
+    dict set badSize data size 4
+    set badType $reordered
+    dict set badType data type directory
+    set badCrc $reordered
+    dict set badCrc data crc32 87654321
+    set missingField $reordered
+    dict unset missingField data size
+    set unknownField $missingField
+    dict set unknownField data unknown 3
+    set cases [list \
+        reordered $reordered 0 1 \
+        missing $subset 0 0 \
+        partial $subset 1 1 \
+        added $extra 1 0 \
+        size $badSize 1 0 \
+        type $badType 1 0 \
+        crc $badCrc 1 0 \
+        missing-field $missingField 0 0 \
+        unknown-field $unknownField 0 0]
+    foreach {name actual allowMissing result} $cases {
+        test inventory-fields-9.$name {inventory comparison ignores field order while preserving all change checks} -body {
+            ::tclvenv::sameInventory $expectedInventory $actual $allowMissing
+        } -result $result
+    }
+
+    test inventory-fields-9.integration {reordered persisted dictionaries pass doctor and removal with unchanged files} -setup {
+        fixture reordered
+        set source [file join $root localpkg]
+        file mkdir [file join $source empty]
+        putFile [file join $source pkgIndex.tcl] {}
+        putFile [file join $source data] unchanged
+        manager install $envdir $source
+        set manifest [file join $envdir metadata installed.tcldata]
+        set records [::tclvenv::readData $manifest]
+        set record [reverseDictionary [dict get $records localpkg]]
+        set files {}
+        dict for {path info} [reverseDictionary [dict get $record files]] {
+            dict set files $path [reverseDictionary $info]
+        }
+        dict set record files $files
+        dict set records localpkg $record
+        ::tclvenv::writeData $manifest $records
+        set coreManifest [file join $envdir metadata core-files.tcldata]
+        set coreFiles {}
+        dict for {path info} [reverseDictionary [::tclvenv::readData $coreManifest]] {
+            dict set coreFiles $path [reverseDictionary $info]
+        }
+        ::tclvenv::writeData $coreManifest $coreFiles
+    } -body {
+        set healthy [string match {*Runtime and installed files: OK*} [manager doctor $envdir]]
+        manager remove $envdir localpkg
+        list $healthy [dict exists [::tclvenv::installed $envdir] localpkg] \
+            [file exists [file join $envdir lib localpkg]] [getFile [file join $source data]]
+    } -cleanup { cleanup } -result {1 0 0 unchanged}
+
+    ::tclvenv::deleteOwned $work
+    removeDirectory $work
+    cleanupTests
+}

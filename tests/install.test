@@ -1,0 +1,248 @@
+package require tcltest 2
+# install.sh: where it installs, PATH handling, upgrades, refusals, uninstall.
+# Every case uses a private HOME and a private prefix; nothing outside the
+# test's temporary directory is touched.
+namespace eval ::installsh {
+    namespace import ::tcltest::*
+    variable project [file dirname [file dirname [file normalize [info script]]]]
+    variable script [file join $project install.sh]
+    variable work [makeDirectory "install-[pid]"]
+    variable count 0
+    variable basePath /usr/local/bin:/usr/bin:/bin
+    testConstraint unix [expr {$::tcl_platform(platform) eq "unix"}]
+    foreach shell {dash bash} {
+        testConstraint $shell [expr {$::tcl_platform(platform) eq "unix" && [auto_execok $shell] ne ""}]
+    }
+    testConstraint notRoot [expr {$::tcl_platform(platform) eq "unix" && [exec id -u] != 0}]
+    testConstraint pty [expr {$::tcl_platform(platform) eq "unix" && [auto_execok script] ne ""}]
+
+    proc putText {path text} {
+        file mkdir [file dirname $path]
+        set ch [open $path w]
+        try { fconfigure $ch -translation lf; puts -nonewline $ch $text } finally { close $ch }
+        return $path
+    }
+    proc getText {path} {
+        set ch [open $path r]
+        try { read $ch } finally { close $ch }
+    }
+    proc fresh {{name dir}} {
+        variable work
+        variable count
+        set path [file join $work $name[incr count]]
+        file mkdir $path
+        return $path
+    }
+    # Runs install.sh with shell, a HOME and arguments: {status stdout stderr}.
+    proc install {shell home args} {
+        variable script
+        variable work
+        variable basePath
+        set out [file join $work out]
+        set err [file join $work err]
+        set status 0
+        if {[catch {exec -- env -i HOME=$home PATH=$basePath {*}[envExtra] \
+                $shell $script {*}$args < /dev/null > $out 2> $err} message options]} {
+            set code [dict get $options -errorcode]
+            set status [expr {[lindex $code 0] eq "CHILDSTATUS" ? [lindex $code 2] : $message}]
+        }
+        list $status [getText $out] [getText $err]
+    }
+    variable extra {}
+    proc envExtra {} { variable extra; return $extra }
+    # Everything under a directory, relative, sorted.
+    proc tree {root} {
+        set result {}
+        set queue [list $root]
+        while {[llength $queue]} {
+            set queue [lassign $queue item]
+            foreach child [glob -nocomplain -directory $item -- * .*] {
+                if {[file tail $child] in {. ..}} continue
+                lappend result [string range $child [string length $root]+1 end]
+                if {[file isdirectory $child] && [file type $child] ne "link"} { lappend queue $child }
+            }
+        }
+        lsort $result
+    }
+    proc blocks {path} {
+        if {![file exists $path]} { return 0 }
+        llength [regexp -all -inline -line {^# >>> tclvenv PATH .* >>>$} [getText $path]]
+    }
+    # Runs the installed command with only the startup file's PATH.
+    proc viaProfile {home} {
+        variable basePath
+        exec -- env -i HOME=$home PATH=$basePath sh -c {. "$HOME/.profile" >/dev/null 2>&1; command -v tclvenv; tclvenv --version}
+    }
+
+    foreach shell {dash bash} {
+        test user-$shell "--user: ~/.local, PATH lines, runs, uninstalls clean ($shell)" -constraints $shell -body {
+            set home [fresh home]
+            putText [file join $home .profile] "# mine\n"
+            putText [file join $home .bashrc] "# my bashrc\n"
+            set before [list [getText [file join $home .profile]] [getText [file join $home .bashrc]]]
+            lassign [install $shell $home --user --path] status out err
+            set command [file join $home .local bin tclvenv]
+            set result [list $status $err [file executable $command] \
+                [file isfile [file join $home .local share tclvenv lib manager.tcl]] \
+                [blocks [file join $home .profile]] [blocks [file join $home .bashrc]] \
+                [lindex [split [viaProfile $home] \n] 1]]
+            lassign [install $shell $home --user --uninstall] ustatus
+            lappend result $ustatus [tree [file join $home .local]] \
+                [expr {[list [getText [file join $home .profile]] [getText [file join $home .bashrc]]] eq $before}]
+        } -result {0 {} 1 1 1 1 0.1.0 0 {bin share} 1}
+    }
+    test user-bin {--user-bin: the command in ~/bin} -constraints dash -body {
+        set home [fresh home]
+        lassign [install dash $home --user-bin --no-path] status out err
+        list $status [file executable [file join $home bin tclvenv]] \
+            [file isfile [file join $home .local share tclvenv tclvenv.tcl]] [file exists [file join $home .profile]] \
+            [string match "*not on your PATH*" $out]
+    } -result {0 1 1 0 1}
+    test prefix-hostile {--prefix with spaces and quotes; PATH lines quote it} -constraints dash -body {
+        set home [fresh home]
+        set prefix [file join [fresh] "my tools 'x' \$HOME"]
+        lassign [install dash $home --prefix $prefix --path] status out err
+        list $status $err [expr {[viaProfile $home] eq "[file join $prefix bin tclvenv]\n0.1.0"}] \
+            [file isfile [file join $prefix share tclvenv tclvenv.tcl]]
+    } -result {0 {} 1 1}
+    test tilde {a ~ in --bindir and --datadir is the HOME} -constraints dash -body {
+        set home [fresh home]
+        lassign [install dash $home --bindir ~/tools --datadir ~/opt/tv --no-path] status
+        list $status [file executable [file join $home tools tclvenv]] [file isfile [file join $home opt tv tclvenv.tcl]]
+    } -result {0 1 1}
+    test bindir-uninstall {uninstall finds a --bindir command through the manifest} -constraints dash -body {
+        set home [fresh home]
+        install dash $home --bindir [file join $home tools] --no-path
+        lassign [install dash $home --uninstall] status
+        list $status [file exists [file join $home tools tclvenv]] [file exists [file join $home .local share tclvenv]]
+    } -result {0 0 0}
+    test upgrade {reinstalling replaces the files and keeps one PATH block} -constraints dash -body {
+        set home [fresh home]
+        install dash $home --user --path
+        putText [file join $home .local share tclvenv stale.txt] "old\n"
+        lassign [install dash $home --user] status
+        list $status [file exists [file join $home .local share tclvenv stale.txt]] [blocks [file join $home .profile]] \
+            [string match "*startup-file*" [getText [file join $home .local share tclvenv .install-manifest]]]
+    } -result {0 0 1 1}
+    test foreign-command {a tclvenv command not from this script is kept, unless --force} -constraints dash -body {
+        set home [fresh home]
+        set command [putText [file join $home .local bin tclvenv] "#!/bin/sh\necho mine\n"]
+        lassign [install dash $home --user] status out err
+        set kept [getText $command]
+        lassign [install dash $home --user --force --no-path] forced
+        list $status [string match "*didn't install it*" $err] $kept $forced [string match "*Installed by tclvenv install.sh*" [getText $command]]
+    } -result [list 1 1 "#!/bin/sh\necho mine\n" 0 1]
+    test foreign-datadir {a data directory not from this script is refused} -constraints dash -body {
+        set home [fresh home]
+        putText [file join $home .local share tclvenv keep.txt] "keep\n"
+        lassign [install dash $home --user] status out err
+        list $status [string match "*isn't an install by this script*" $err] [file exists [file join $home .local share tclvenv keep.txt]]
+    } -result {1 1 1}
+    test uninstall-foreign {uninstall leaves files this script didn't install} -constraints dash -body {
+        set home [fresh home]
+        set command [putText [file join $home .local bin tclvenv] "#!/bin/sh\n"]
+        lassign [install dash $home --user --uninstall] status out err
+        list $status [file exists $command]
+    } -result {1 1}
+    test dry-run {--dry-run changes nothing} -constraints dash -body {
+        set home [fresh home]
+        putText [file join $home .profile] "# mine\n"
+        lassign [install dash $home --user --path --dry-run] status out err
+        list $status [tree $home] [string match "*would write*" $out]
+    } -result {0 .profile 1}
+    test system-not-root {--system without root says to use sudo, changes nothing} -constraints {dash notRoot} -body {
+        set home [fresh home]
+        lassign [install dash $home --system] status out err
+        list $status [string match "*needs root*" $err] [file exists /usr/local/share/tclvenv/.install-manifest]
+    } -result {1 1 0}
+    test no-tcl {no Tcl found: a clear message} -constraints dash -body {
+        set home [fresh home]
+        lassign [install dash $home --user --tcl [file join $home missing-tclsh]] status out err
+        list $status [string match "install.sh: *" $err] [file exists [file join $home .local]]
+    } -result {1 1 0}
+    test old-tcl {a Tcl older than 8.6 is refused} -constraints dash -body {
+        set home [fresh home]
+        set fake [putText [file join $home fake-tclsh] "#!/bin/sh\necho 8.5.19\n"]
+        file attributes $fake -permissions 0755
+        lassign [install dash $home --user --tcl $fake] status out err
+        list $status [string match "*needs 8.6 or newer*" $err]
+    } -result {1 1}
+    test tcl-choice {--tcl is the interpreter the command runs; TCLVENV_TCLSH overrides it} -constraints dash -body {
+        set home [fresh home]
+        set tcl [lindex [auto_execok tclsh8.6] 0]
+        if {$tcl eq ""} { set tcl [info nameofexecutable] }
+        install dash $home --user --tcl $tcl --no-path
+        set command [file join $home .local bin tclvenv]
+        list [string match "*[list $tcl]*" [getText $command]] \
+            [exec -- env TCLVENV_TCLSH=[info nameofexecutable] $command --version]
+    } -result {1 0.1.0}
+    test colon-bindir {a command directory PATH can't hold is refused} -constraints dash -body {
+        set home [fresh home]
+        lassign [install dash $home --bindir [file join $home a:b]] status out err
+        list $status [string match "*contains ':'*" $err]
+    } -result {1 1}
+    test interactive {the menu on a terminal: choice 2 and yes to PATH} -constraints {pty dash} -body {
+        variable script
+        variable basePath
+        set home [fresh home]
+        set answers [putText [file join $home answers] "2\ny\n"]
+        exec -- env -i HOME=$home PATH=$basePath TERM=dumb script -qec [list dash $script] /dev/null < $answers
+        list [file executable [file join $home bin tclvenv]] [blocks [file join $home .profile]]
+    } -result {1 1}
+
+    # Regressions for the installer fuzz group (tests/FUZZ_OUTPUTS_REPORT.md).
+    proc sourced {home name} {
+        variable basePath
+        set shell [expr {$name eq ".bashrc" ? "bash" : "sh"}]
+        exec -- env -i HOME=$home PATH=$basePath $shell -c ". \"\$HOME/$name\"; printf '%s|%s' \"\${FUZZ-}\" \"\$PATH\""
+    }
+    test newline-1 {a startup file without a final newline: kept working, restored byte for byte} -constraints dash -body {
+        set home [fresh home]
+        set profile [putText [file join $home .profile] "# mine\nFUZZ=ran; export FUZZ"]
+        set before [getText $profile]
+        lassign [install dash $home --user --path] status
+        lassign [split [sourced $home .profile] |] fuzz path
+        set onPath [expr {[file join $home .local bin] in [split $path :]}]
+        install dash $home --user --uninstall
+        list $status $fuzz $onPath [expr {[getText $profile] eq $before}]
+    } -result {0 ran 1 1}
+    test newline-1.later-lines {lines added after the block are kept on uninstall} -constraints dash -body {
+        set home [fresh home]
+        set profile [putText [file join $home .profile] "FUZZ=ran"]
+        install dash $home --user --path
+        set ch [open $profile a]; puts $ch "LATER=1"; close $ch
+        install dash $home --user --uninstall
+        getText $profile
+    } -result "FUZZ=ran\nLATER=1\n"
+    test readonly-2 {a read-only startup file is skipped with a warning; the install succeeds} -constraints {dash notRoot} -body {
+        set home [fresh home]
+        set bashrc [putText [file join $home .bashrc] "# rc\n"]
+        file attributes $bashrc -permissions 0444
+        lassign [install dash $home --user --path] status out err
+        set manifest [getText [file join $home .local share tclvenv .install-manifest]]
+        list $status [string match "install.sh: can't change *.bashrc*" $err] [getText $bashrc] \
+            [string match "*.bashrc*" $manifest] [blocks [file join $home .profile]]
+    } -result [list 0 1 "# rc\n" 0 1]
+    test dangling-2 {a dangling ~/.profile link is left alone} -constraints dash -body {
+        set home [fresh home]
+        exec ln -s [file join $home dotfiles profile] [file join $home .profile]
+        lassign [install dash $home --user --path] status out err
+        list $status [string match "install.sh: can't change*" $err] [file type [file join $home .profile]] \
+            [file exists [file join $home dotfiles]]
+    } -result {0 1 link 0}
+    test two-installs-3 {two installs keep their own PATH lines} -constraints dash -body {
+        set home [fresh home]
+        set prefix [file join $home tools]
+        install dash $home --user --path
+        install dash $home --prefix $prefix --path
+        lassign [split [sourced $home .profile] |] - path
+        set both [expr {[file join $home .local bin] in [split $path :] && [file join $prefix bin] in [split $path :]}]
+        install dash $home --prefix $prefix --uninstall
+        lassign [split [sourced $home .profile] |] - path
+        list $both [blocks [file join $home .profile]] [expr {[file join $home .local bin] in [split $path :]}] \
+            [expr {[file join $prefix bin] in [split $path :]}]
+    } -result {1 1 1 0}
+
+    cleanupTests
+}
+namespace delete ::installsh

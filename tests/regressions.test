@@ -1,0 +1,580 @@
+package require tcltest 2
+namespace eval ::regression {
+    namespace import ::tcltest::*
+    variable project [file dirname [file dirname [file normalize [info script]]]]
+    source [file join $project lib manager.tcl]
+    variable host [info nameofexecutable]
+    variable cli [file join $project tclvenv.tcl]
+    variable work [makeDirectory "regressions-[pid]"]
+    variable envdir [file join $work env]
+    exec -- $host $cli create $envdir
+    testConstraint unix [expr {$::tcl_platform(platform) eq "unix"}]
+
+    proc putFile {path data} {
+        set ch [open $path w]
+        try {
+            fconfigure $ch -encoding utf-8 -translation lf
+            puts -nonewline $ch $data
+        } finally { close $ch }
+        return $path
+    }
+    proc getFile {path} {
+        set ch [open $path r]
+        try { read $ch } finally { close $ch }
+    }
+    proc cli {args} {
+        variable host
+        variable cli
+        exec -- $host $cli {*}$args
+    }
+    proc records {} {
+        variable envdir
+        ::tclvenv::installed $envdir
+    }
+    proc packageDir {name} {
+        variable work
+        set path [file join $work $name]
+        file mkdir $path
+        putFile [file join $path pkgIndex.tcl] {}
+        putFile [file join $path first] first
+        putFile [file join $path second] second
+        return $path
+    }
+    proc restoreCommand {command saved} {
+        if {[llength [info commands $saved]]} {
+            rename $command {}
+            rename $saved $command
+        }
+    }
+    proc stageNames {} {
+        variable envdir
+        glob -nocomplain -directory [file join $envdir metadata] stage-* remove-*
+    }
+
+    # Inject filesystem changes after moveExclusive's destination check but
+    # immediately before the actual rename. This models an independent writer.
+    proc hookRename {destination {action collision}} {
+        variable hookDestination $destination
+        variable hookAction $action
+        variable armed 1
+        rename ::file ::regression::savedFile
+        proc ::file {operation args} {
+            if {$operation eq "rename" && [lindex $args end] eq $::regression::hookDestination &&
+                $::regression::armed} {
+                set ::regression::armed 0
+                if {$::regression::hookAction eq "collision"} {
+                    ::regression::savedFile mkdir $::regression::hookDestination
+                    ::regression::putFile [::regression::savedFile join $::regression::hookDestination precious] unrelated
+                } elseif {$::regression::hookAction eq "file-collision"} {
+                    ::regression::putFile $::regression::hookDestination unrelated
+                } else {
+                    set path [lindex $args end-1]
+                    if {[::regression::savedFile isdirectory $path]} {
+                        ::regression::putFile [::regression::savedFile join $path late] update
+                    } else {
+                        set ch [open $path a]
+                        puts $ch {# concurrent update}
+                        close $ch
+                    }
+                }
+            }
+            tailcall ::regression::savedFile $operation {*}$args
+        }
+    }
+
+    test publication-1.1 {module publication race never deletes an unrelated destination} -setup {
+        set module [putFile [file join $work collide-1.0.tm] {package provide collide 1.0}]
+        set target [file join $envdir modules collide-1.0.tm]
+        hookRename $target
+        rename ::tclvenv::writeData ::tclvenv::__savedWrite
+        proc ::tclvenv::writeData {path data} {
+            if {[file tail $path] eq "installed.tcldata"} { error {injected disk full} }
+            ::tclvenv::__savedWrite $path $data
+        }
+    } -body {
+        set code [catch {::tclvenv::install $envdir $module} result]
+        list $code [string match {*destination appeared*} $result] \
+            [getFile [file join $target precious]] [dict exists [records] collide@1.0] \
+            [llength [stageNames]] [llength [::tclvenv::children $target]]
+    } -cleanup {
+        restoreCommand ::file ::regression::savedFile
+        restoreCommand ::tclvenv::writeData ::tclvenv::__savedWrite
+        ::tclvenv::deleteOwned $target
+    } -result {1 1 unrelated 0 0 1}
+
+    test publication-1.2 {directory publication race leaves the unrelated tree intact} -setup {
+        set source [packageDir collision-dir]
+        set target [file join $envdir lib collision-dir]
+        hookRename $target
+    } -body {
+        set code [catch {::tclvenv::install $envdir $source} result]
+        list $code [string match {*destination appeared*} $result] \
+            [getFile [file join $target precious]] [dict exists [records] collision-dir] \
+            [llength [stageNames]] [llength [::tclvenv::children $target]]
+    } -cleanup {
+        restoreCommand ::file ::regression::savedFile
+        ::tclvenv::deleteOwned $target
+    } -result {1 1 unrelated 0 0 1}
+
+    test publication-1.3 {a genuine package may itself contain a payload directory} -setup {
+        set source [packageDir nested-payload]
+        file mkdir [file join $source payload]
+        putFile [file join $source payload contents] nested
+    } -body {
+        cli install $envdir $source
+        list [getFile [file join $envdir lib nested-payload payload contents]] \
+            [string match {*OK*} [cli doctor $envdir]]
+    } -cleanup {
+        cli remove $envdir nested-payload
+    } -result {nested 1}
+
+    test publication-1.4 {metadata failure rolls back only the detached owned package} -setup {
+        set module [putFile [file join $work rollback-1.0.tm] {package provide rollback 1.0}]
+        rename ::tclvenv::writeData ::tclvenv::__savedWrite
+        proc ::tclvenv::writeData {path data} {
+            if {[file tail $path] eq "installed.tcldata"} { error {injected disk full} }
+            ::tclvenv::__savedWrite $path $data
+        }
+    } -body {
+        set code [catch {::tclvenv::install $envdir $module} result]
+        list $code [string match {*disk full*} $result] \
+            [file exists [file join $envdir modules rollback-1.0.tm]] \
+            [dict exists [records] rollback@1.0] [llength [stageNames]]
+    } -cleanup {
+        restoreCommand ::tclvenv::writeData ::tclvenv::__savedWrite
+    } -result {1 1 0 0 0}
+
+    test publication-1.5 {modified published files survive a failed metadata update} -setup {
+        set source [packageDir rollback-change]
+        set changedTarget [file join $envdir lib rollback-change]
+        rename ::tclvenv::writeData ::tclvenv::__savedWrite
+        proc ::tclvenv::writeData {path data} {
+            if {[file tail $path] eq "installed.tcldata"} {
+                ::regression::putFile [file join $::regression::changedTarget precious] unrelated
+                error {injected metadata failure}
+            }
+            ::tclvenv::__savedWrite $path $data
+        }
+    } -body {
+        set code [catch {::tclvenv::install $envdir $source} result]
+        list $code [string match {*recovery journal:*} $result] \
+            [getFile [file join $changedTarget precious]] \
+            [dict exists [records] rollback-change] [llength [stageNames]]
+    } -cleanup {
+        restoreCommand ::tclvenv::writeData ::tclvenv::__savedWrite
+        ::tclvenv::deleteOwned $changedTarget
+        foreach stage [stageNames] { ::tclvenv::deleteOwned $stage }
+    } -result {1 1 unrelated 0 1}
+
+    test publication-1.6 {an incomplete publication retains its journal and every staged file} -setup {
+        set source [packageDir incomplete-publication]
+        set target [file join $envdir lib incomplete-publication]
+        rename ::tclvenv::moveExclusive ::tclvenv::__savedMove
+        proc ::tclvenv::moveExclusive {source destination} {
+            if {$destination eq $::regression::target} {
+                file mkdir $destination
+                ::regression::putFile [file join $destination precious] unrelated
+                file rename -- $source [file join $destination payload]
+                error {injected failure to restore the nested publication}
+            }
+            ::tclvenv::__savedMove $source $destination
+        }
+    } -body {
+        set code [catch {::tclvenv::install $envdir $source} result]
+        set stages [stageNames]
+        list $code [string match {*recovery journal:*} $result] \
+            [getFile [file join $target precious]] [getFile [file join $target payload first]] \
+            [llength $stages] [file isfile [file join [lindex $stages 0] transaction.tcldata]]
+    } -cleanup {
+        restoreCommand ::tclvenv::moveExclusive ::tclvenv::__savedMove
+        ::tclvenv::deleteOwned $target
+        foreach stage [stageNames] { ::tclvenv::deleteOwned $stage }
+    } -result {1 1 unrelated first 1 1}
+
+    test publication-1.7 {a late-created regular file is never overwritten or recorded as installed} -setup {
+        set module [putFile [file join $work regularcollision-1.0.tm] {package provide regularcollision 1.0}]
+        set target [file join $envdir modules regularcollision-1.0.tm]
+        hookRename $target file-collision
+    } -body {
+        set code [catch {::tclvenv::install $envdir $module}]
+        list $code [getFile $target] [dict exists [records] regularcollision@1.0] \
+            [llength [stageNames]] [getFile $module]
+    } -cleanup {
+        restoreCommand ::file ::regression::savedFile
+        if {[dict exists [records] regularcollision@1.0]} {
+            cli remove $envdir regularcollision@1.0
+        } else { ::tclvenv::deleteOwned $target }
+    } -result {1 unrelated 0 0 {package provide regularcollision 1.0}}
+
+    test permissions-2.1 {read-only sources install and remove without modifying the source} -constraints unix -setup {
+        set source [packageDir readonly]
+        file mkdir [file join $source subdir]
+        putFile [file join $source subdir data] preserved
+        file attributes [file join $source subdir] -permissions 0555
+        file attributes $source -permissions 0555
+    } -body {
+        cli install $envdir $source
+        set value [getFile [file join $envdir lib readonly subdir data]]
+        cli remove $envdir readonly
+        list $value [dict exists [records] readonly] \
+            [expr {[file attributes $source -permissions] & 0o777}] \
+            [expr {[file attributes [file join $source subdir] -permissions] & 0o777}] \
+            [llength [stageNames]]
+    } -cleanup {
+        ::tclvenv::deleteOwned $source
+    } -result {preserved 0 365 365 0}
+
+    test removal-3.1 {changes made immediately before detaching a module are preserved} -setup {
+        set module [putFile [file join $work latechange-1.0.tm] {package provide latechange 1.0}]
+        cli install $envdir $module
+        set public [file join $envdir modules latechange-1.0.tm]
+        # Arm for the staging destination allocated by remove, discovered at
+        # the move call, and mutate the public source at the rename boundary.
+        rename ::tclvenv::moveExclusive ::tclvenv::__savedMove
+        proc ::tclvenv::moveExclusive {source destination} {
+            if {$source eq $::regression::public} { ::regression::hookRename $destination update }
+            ::tclvenv::__savedMove $source $destination
+        }
+    } -body {
+        set code [catch {::tclvenv::remove $envdir latechange@1.0} result]
+        list $code [string match {*changed*} $result] \
+            [string match {*concurrent update*} [getFile $public]] \
+            [dict get [records] latechange@1.0 state] [llength [stageNames]]
+    } -cleanup {
+        restoreCommand ::file ::regression::savedFile
+        restoreCommand ::tclvenv::moveExclusive ::tclvenv::__savedMove
+        file copy -force -- $module $public
+        cli remove $envdir latechange@1.0
+    } -result {1 1 1 installed 0}
+
+    test removal-3.2 {files added immediately before detaching a directory are preserved} -setup {
+        set source [packageDir late-directory]
+        cli install $envdir $source
+        set public [file join $envdir lib late-directory]
+        rename ::tclvenv::moveExclusive ::tclvenv::__savedMove
+        proc ::tclvenv::moveExclusive {source destination} {
+            if {$source eq $::regression::public} { ::regression::hookRename $destination update }
+            ::tclvenv::__savedMove $source $destination
+        }
+    } -body {
+        set code [catch {::tclvenv::remove $envdir late-directory} result]
+        list $code [string match {*changed*} $result] [getFile [file join $public late]] \
+            [dict get [records] late-directory state] [llength [stageNames]]
+    } -cleanup {
+        restoreCommand ::file ::regression::savedFile
+        restoreCommand ::tclvenv::moveExclusive ::tclvenv::__savedMove
+        file delete -- [file join $public late]
+        cli remove $envdir late-directory
+    } -result {1 1 update installed 0}
+
+    test removal-3.3 {partial deletion retains a pending record and can be retried} -setup {
+        set source [packageDir partial]
+        cli install $envdir $source
+        rename ::tclvenv::deleteOwned ::tclvenv::__savedDelete
+        proc ::tclvenv::deleteOwned {path} {
+            if {[file tail $path] eq "payload" && [string match remove-* [file tail [file dirname $path]]]} {
+                file delete -- [file join $path first]
+                error {injected deletion failure}
+            }
+            ::tclvenv::__savedDelete $path
+        }
+    } -body {
+        set code [catch {::tclvenv::remove $envdir partial} result]
+        set record [dict get [records] partial]
+        set staged [file join $envdir metadata [dict get $record stage] payload]
+        catch {cli doctor $envdir} diagnostic
+        set before [list $code [string match {*deletion failure*} $result] \
+            [dict get $record state] [file exists [file join $staged first]] \
+            [getFile [file join $staged second]] [string match {*unfinished removal*retry:*} $diagnostic] \
+            [string match {*partial*removing*} [cli list $envdir]]]
+        if {![string match {*Installed packages: 0*Pending removals: 1*} [cli info $envdir]]} {
+            error {info must distinguish pending removals from installed packages}
+        }
+        restoreCommand ::tclvenv::deleteOwned ::tclvenv::__savedDelete
+        cli remove $envdir partial
+        concat $before [list [dict exists [records] partial] [llength [stageNames]]]
+    } -cleanup {
+        restoreCommand ::tclvenv::deleteOwned ::tclvenv::__savedDelete
+    } -result {1 1 removing 0 second 1 1 0 0}
+
+    test removal-3.4 {failure to persist the removal state restores the complete package} -setup {
+        set source [packageDir persist-fail]
+        cli install $envdir $source
+        rename ::tclvenv::writeData ::tclvenv::__savedWrite
+        proc ::tclvenv::writeData {path data} {
+            if {[file tail $path] eq "installed.tcldata"} { error {injected metadata failure} }
+            ::tclvenv::__savedWrite $path $data
+        }
+    } -body {
+        set code [catch {::tclvenv::remove $envdir persist-fail} result]
+        list $code [string match {*metadata failure*} $result] \
+            [getFile [file join $envdir lib persist-fail first]] \
+            [dict get [records] persist-fail state] [llength [stageNames]]
+    } -cleanup {
+        restoreCommand ::tclvenv::writeData ::tclvenv::__savedWrite
+        cli remove $envdir persist-fail
+    } -result {1 1 first installed 0}
+
+    test removal-3.5 {failure of the final metadata write is safely resumable} -setup {
+        set source [packageDir final-write]
+        cli install $envdir $source
+        rename ::tclvenv::writeData ::tclvenv::__savedWrite
+        proc ::tclvenv::writeData {path data} {
+            if {[file tail $path] eq "installed.tcldata" && ![dict exists $data final-write]} {
+                error {injected final write failure}
+            }
+            ::tclvenv::__savedWrite $path $data
+        }
+    } -body {
+        set code [catch {::tclvenv::remove $envdir final-write} result]
+        if {![string match {*final write failure*} $result]} { error $result }
+        set record [dict get [records] final-write]
+        set state [dict get $record state]
+        set stage [file join $envdir metadata [dict get $record stage]]
+        if {![file isfile [file join $stage transaction.tcldata]] ||
+            [file exists [file join $stage payload]]} {
+            error {failed final write must retain the journal after deleting the payload}
+        }
+        # An unrelated writer may reuse the public location before the retry.
+        file mkdir [file join $envdir lib final-write]
+        putFile [file join $envdir lib final-write precious] unrelated
+        restoreCommand ::tclvenv::writeData ::tclvenv::__savedWrite
+        cli remove $envdir final-write
+        list $code $state [dict exists [records] final-write] \
+            [getFile [file join $envdir lib final-write precious]] [llength [stageNames]]
+    } -cleanup {
+        restoreCommand ::tclvenv::writeData ::tclvenv::__savedWrite
+        ::tclvenv::deleteOwned [file join $envdir lib final-write]
+    } -result {1 removing 0 unrelated 0}
+
+    test removal-3.6 {new data in a pending removal is preserved on retry} -setup {
+        set source [packageDir pending-change]
+        cli install $envdir $source
+        rename ::tclvenv::deleteOwned ::tclvenv::__savedDelete
+        proc ::tclvenv::deleteOwned {path} {
+            if {[file tail $path] eq "payload"} { error {injected locked file} }
+            ::tclvenv::__savedDelete $path
+        }
+        catch {::tclvenv::remove $envdir pending-change}
+        restoreCommand ::tclvenv::deleteOwned ::tclvenv::__savedDelete
+        set pending [file join $envdir metadata [dict get [records] pending-change stage] payload]
+        putFile [file join $pending precious] unrelated
+    } -body {
+        set code [catch {cli remove $envdir pending-change} result]
+        list $code [string match {*staged package files changed*} $result] \
+            [getFile [file join $pending precious]] [dict get [records] pending-change state]
+    } -cleanup {
+        restoreCommand ::tclvenv::deleteOwned ::tclvenv::__savedDelete
+        file delete -- [file join $pending precious]
+        cli remove $envdir pending-change
+    } -result {1 1 unrelated removing}
+
+    test removal-3.7 {malformed removal state cannot delete outside private staging} -setup {
+        set manifest [file join $envdir metadata installed.tcldata]
+        set saved [records]
+        set changed $saved
+        dict set changed invalid [dict create target lib/invalid files {} state removing stage ../lib]
+        ::tclvenv::writeData $manifest $changed
+    } -body {
+        set code [catch {cli remove $envdir invalid} result]
+        list $code [string match {*invalid removal staging path*} $result] \
+            [file isdirectory [file join $envdir lib]]
+    } -cleanup {
+        ::tclvenv::writeData $manifest $saved
+    } -result {1 1 1}
+
+    # Bounded, event-driven child I/O. A regressed callback must fail the test,
+    # rather than leave the test suite stuck in a blocking read or close.
+    proc collect {channel} {
+        variable output
+        variable finished
+        append output [read $channel]
+        if {[eof $channel]} { set finished 1 }
+    }
+    proc feed {channel text} {
+        variable inputError
+        if {[catch {puts -nonewline $channel $text; flush $channel; chan close $channel write} message]} {
+            set inputError $message
+        }
+    }
+    proc expire {channel} {
+        variable expired 1
+        variable finished 1
+        foreach pid [pid $channel] { catch {exec kill -KILL -- $pid} }
+    }
+    proc communicate {initial {later ""} {mode --stdin} {startupDelay 0}} {
+        variable host
+        variable envdir
+        variable work
+        variable output ""
+        variable finished 0
+        variable expired 0
+        variable inputError ""
+        set command [list $host [file join $envdir metadata runtime.tcl] $mode]
+        set driver ""
+        if {$startupDelay} {
+            set driver [file join $work stdin-startup.tcl]
+            putFile $driver "[list after $startupDelay]\n[list source [file join $envdir metadata runtime.tcl]]\n"
+            set command [list $host $driver $mode]
+        }
+        set ch [open [concat | $command [list 2>@1]] r+]
+        set feedTimer ""
+        set timer [after 4000 [list ::regression::expire $ch]]
+        try {
+            fconfigure $ch -blocking 0 -buffering none -translation lf
+            fileevent $ch readable [list ::regression::collect $ch]
+            puts -nonewline $ch $initial
+            flush $ch
+            if {$later ne ""} {
+                set feedTimer [after 150 [list ::regression::feed $ch $later]]
+            } else { chan close $ch write }
+            vwait ::regression::finished
+            fileevent $ch readable {}
+            fconfigure $ch -blocking 1
+            set code 0
+            if {[catch {close $ch} result options]} {
+                set code 1
+                if {[lindex [dict get $options -errorcode] 0] eq "CHILDSTATUS"} {
+                    set code [lindex [dict get $options -errorcode] 2]
+                }
+            }
+            set ch ""
+            if {$expired} { error "child process timed out: $output" }
+            if {$inputError ne ""} { error $inputError }
+            return [list $code [string trimright $output \n]]
+        } finally {
+            after cancel $timer
+            if {$feedTimer ne ""} { after cancel $feedTimer }
+            if {$ch ne ""} {
+                foreach pid [pid $ch] { catch {exec kill -KILL -- $pid} }
+                catch {close $ch}
+            }
+            if {$driver ne ""} { file delete -- $driver }
+        }
+    }
+
+    test stdin-4.1 {commands consume delayed stdin with normal blocking semantics} -constraints unix -body {
+        communicate "puts \[fconfigure stdin -blocking\]\nputs \[gets stdin\]\n" "payload\n"
+    } -result [list 0 "1\npayload"]
+
+    test stdin-4.2 {read waits for a producer to close its input} -constraints unix -body {
+        communicate "puts \[fconfigure stdin -blocking\]\nputs \[read stdin\]\n" payload
+    } -result [list 0 "1\npayload"]
+
+    test stdin-4.3 {closing stdin terminates normally instead of hanging} -constraints unix -body {
+        communicate "close stdin\n"
+    } -result {0 {}}
+
+    test stdin-4.4 {an unexpected callback error terminates rather than hanging in vwait} -constraints unix -body {
+        lassign [communicate "close stdout\n" {} --interactive] code output
+        list $code [string match {*channel*stdout*} $output]
+    } -result {1 1}
+
+    test stdin-4.5 {blocking mode remains asserted when slow startup prebuffers all gets input} -constraints unix -body {
+        communicate "puts \[fconfigure stdin -blocking\]\nputs \[gets stdin\]\n" "payload\n" --stdin 500
+    } -result [list 0 "1\npayload"]
+
+    test stdin-4.6 {blocking mode remains asserted when slow startup prebuffers all read input} -constraints unix -body {
+        communicate "puts \[fconfigure stdin -blocking\]\nputs \[read stdin\]\n" payload --stdin 500
+    } -result [list 0 "1\npayload"]
+
+    test snapshot-5.1 {core modules work from a standard sibling layout without exposing other modules} -setup {
+        source [file join $project lib core.tcl]
+        set fixture [file join $work stock]
+        set library [file join $fixture lib tcl[info tclversion]]
+        file mkdir [file dirname $library]
+        file copy -- [info library] $library
+        set major [lindex [split [info tclversion] .] 0]
+        set modules [::tclvenv::core::snapshot]
+        ::tclvenv::deleteOwned [file join $library tcl$major]
+        set sibling [file join $fixture lib tcl$major [info tclversion]]
+        file mkdir $sibling
+        dict for {relative encoded} $modules {
+            set target [file join $sibling $relative]
+            file mkdir [file dirname $target]
+            set ch [open $target wb]
+            puts -nonewline $ch [binary decode base64 $encoded]
+            if {[string match msgcat-*.tm [file tail $relative]]} {
+                puts $ch {;set ::core_fixture yes}
+            }
+            close $ch
+        }
+        putFile [file join $sibling foreign-1.0.tm] {package provide foreign 1.0}
+        set savedEnv [array get ::env]
+        set ::env(TCL_LIBRARY) $library
+        set driver [putFile [file join $work snapshot-driver.tcl] {
+            source [lindex $argv 0]
+            puts [::tclvenv::core::snapshot]
+        }]
+        set captured [exec -- $host $driver [file join $project lib core.tcl]]
+        set ::env(TCL_LIBRARY) [info library]
+        set stockEnv [file join $work stock-env]
+        cli create $stockEnv
+        set coreRoot [file join $stockEnv metadata core-modules]
+        ::tclvenv::deleteOwned $coreRoot
+        file mkdir $coreRoot
+        dict for {relative encoded} $captured {
+            set target [file join $coreRoot $relative]
+            file mkdir [file dirname $target]
+            set ch [open $target wb]
+            puts -nonewline $ch [binary decode base64 $encoded]
+            close $ch
+        }
+        set cfg [::tclvenv::config $stockEnv]
+        dict set cfg runtime library $library
+        ::tclvenv::writeData [file join $stockEnv tclvenv.cfg] $cfg
+        set ::env(TCL_LIBRARY) $library
+        set app [putFile [file join $work core-app.tcl] {
+            puts [clock format 0 -gmt 1 -format %Y]
+            puts $::core_fixture
+            puts [catch {package require foreign}]
+        }]
+    } -body {
+        exec -- $host [file join $stockEnv metadata runtime.tcl] $app
+    } -cleanup {
+        foreach key [array names ::env] {
+            if {![dict exists $savedEnv $key]} { unset ::env($key) }
+        }
+        dict for {key value} $savedEnv { set ::env($key) $value }
+    } -result "1970\nyes\n1"
+
+    test snapshot-5.2 {doctor verifies the captured core files} -setup {
+        set coreRoot [file join $envdir metadata core-modules]
+        set extra [putFile [file join $coreRoot injected-1.0.tm] {package provide injected 1.0}]
+    } -body {
+        catch {cli doctor $envdir} result
+        string match {*core module snapshot changed*} $result
+    } -cleanup {
+        file delete -- $extra
+    } -result 1
+
+    test snapshot-5.3 {overlapping inherited module roots cannot prevent isolated startup} -setup {
+        set key TCL[join [split [info tclversion] .] _]_TM_PATH
+        set hadKey [info exists ::env($key)]
+        if {$hadKey} { set oldValue $::env($key) }
+        set ::env($key) [join [list $work [file join $work subdir]] $::tcl_platform(pathSeparator)]
+        set driver [putFile [file join $work isolated-startup.tcl] {puts [clock format 0 -gmt 1 -format %Y]}]
+    } -body {
+        exec -- $host [file join $envdir metadata runtime.tcl] $driver
+    } -cleanup {
+        unset ::env($key)
+        if {$hadKey} { set ::env($key) $oldValue }
+    } -result 1970
+
+    test inventory-6.1 {large flat inventories preserve every file and directory} -setup {
+        set flat [file join $work flat]
+        file mkdir $flat
+        for {set i 0} {$i < 3000} {incr i} { putFile [file join $flat file-$i] $i }
+        file mkdir [file join $flat nested]
+        putFile [file join $flat nested .hidden] hidden
+    } -body {
+        set inventory [::tclvenv::inventory $flat]
+        list [dict size $inventory] [dict get $inventory file-2999 size] \
+            [dict get $inventory [file join nested .hidden] size] \
+            [dict get $inventory nested type] [dict get $inventory {} type]
+    } -result {3003 4 6 directory directory}
+
+    ::tclvenv::deleteOwned $work
+    removeDirectory $work
+    cleanupTests
+}

@@ -1,0 +1,86 @@
+package require tcltest 2
+# Regressions for the limits fuzz group (tests/FUZZ_LIMITS_REPORT.md): what
+# the manager reports when a file can't be created or written.
+namespace eval ::limits {
+    namespace import ::tcltest::*
+    variable project [file dirname [file dirname [file normalize [info script]]]]
+    variable host [info nameofexecutable]
+    variable cli [file join $project tclvenv.tcl]
+    variable work [makeDirectory "limits-[pid]"]
+    variable count 0
+    testConstraint unixUser [expr {$::tcl_platform(platform) eq "unix" && [exec id -u] != 0}]
+
+    proc fresh {} {
+        variable work
+        variable count
+        set path [file join $work dir[incr count]]
+        file mkdir $path
+        return $path
+    }
+    # Runs the manager, optionally with a shell prefix (ulimit ...):
+    # {status stderr}.
+    proc manager {args} { managerWith "" {*}$args }
+    proc managerWith {prefix args} {
+        variable host
+        variable cli
+        set words [lmap word [list $host $cli {*}$args] {format '%s' [string map {' '\\''} $word]}]
+        set status 0
+        if {[catch {exec -- sh -c "${prefix}exec [join $words { }] 2>&1 >/dev/null"} out options]} {
+            set code [dict get $options -errorcode]
+            set status [expr {[lindex $code 0] eq "CHILDSTATUS" ? [lindex $code 2] : -1}]
+        }
+        # (exec adds "child process exited abnormally": the message is the first line.)
+        list $status [lindex [split $out \n] 0]
+    }
+    proc package {} {
+        set root [file join [fresh] pkga]
+        file mkdir $root
+        set ch [open [file join $root pkgIndex.tcl] w]
+        puts $ch {package ifneeded pkga 1.0 [list package provide pkga 1.0]}
+        close $ch
+        return $root
+    }
+    proc newEnvironment {} {
+        set path [file join [fresh] env]
+        manager create $path
+        return $path
+    }
+    proc readOnly {path script} {
+        file attributes $path -permissions 0555
+        try { uplevel 1 $script } finally { file attributes $path -permissions 0755 }
+    }
+
+    # 1. A lock file that can't be created is not a lock.
+    test lock-1.environment {a read-only metadata/ is reported as such, not as locked} -constraints unixUser -body {
+        set environment [newEnvironment]
+        set lock [file join $environment metadata mutation.lock]
+        readOnly [file join $environment metadata] {
+            lassign [manager install $environment [package]] status message
+        }
+        list $status [expr {$message eq "tclvenv: couldn't create the lock file $lock: permission denied"}]
+    } -result {1 1}
+    test lock-1.create {a read-only parent for create is reported as such} -constraints unixUser -body {
+        set parent [fresh]
+        readOnly $parent {
+            lassign [manager create [file join $parent env]] status message
+        }
+        list $status [string match "tclvenv: couldn't create the lock file *env.tclvenv-create.lock: permission denied" $message]
+    } -result {1 1}
+    test lock-1.held {a lock that exists is still a lock} -constraints unixUser -body {
+        set environment [newEnvironment]
+        close [open [file join $environment metadata mutation.lock] w]
+        lassign [manager install $environment [package]] status message
+        list $status [string match "tclvenv: environment is locked: *" $message]
+    } -result {1 1}
+
+    # 2. A failed write names the file, and create leaves nothing behind.
+    test write-2.create {create past a file-size limit names the file} -constraints unixUser -body {
+        set parent [fresh]
+        lassign [managerWith "trap '' XFSZ; ulimit -f 100; " create [file join $parent env]] status message
+        list $status [string match "tclvenv: couldn't write [file join $parent]*: file too large" $message] \
+            [glob -nocomplain -tails -directory $parent -- * .*]
+    } -result {1 1 {. ..}}
+
+    cleanupTests
+}
+namespace delete ::limits

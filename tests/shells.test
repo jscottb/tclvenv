@@ -1,0 +1,275 @@
+package require tcltest 2
+# Regressions for the findings of the shell, launcher and command-line fuzz
+# groups (tests/FUZZ_SHELLS_REPORT.md), one or more per finding.
+namespace eval ::shells {
+    namespace import ::tcltest::*
+    variable project [file dirname [file dirname [file normalize [info script]]]]
+    variable host [info nameofexecutable]
+    variable cli [file join $project tclvenv.tcl]
+    variable work [makeDirectory "shells-[pid]"]
+    variable count 0
+    testConstraint unix [expr {$::tcl_platform(platform) eq "unix"}]
+    foreach shell {dash bash busybox python3} {
+        testConstraint $shell [expr {$::tcl_platform(platform) eq "unix" && [auto_execok $shell] ne ""}]
+    }
+
+    proc putText {path text} {
+        file mkdir [file dirname $path]
+        set ch [open $path w]
+        try {
+            fconfigure $ch -encoding utf-8 -translation lf
+            puts -nonewline $ch $text
+        } finally { close $ch }
+        return $path
+    }
+    proc getText {path} {
+        set ch [open $path r]
+        try {
+            fconfigure $ch -encoding utf-8 -translation lf
+            read $ch
+        } finally { close $ch }
+    }
+    # Runs a command in a directory with stdin: {status stdout stderr}.
+    # Arguments are passed through sh, never through exec's grammar.
+    proc run {directory input args} {
+        variable work
+        set in [putText [file join $work stdin] $input]
+        set out [file join $work out]
+        set err [file join $work err]
+        set status 0
+        set script {cd "$1" && shift && exec "$@"}
+        if {[catch {exec -- sh -c $script sh $directory {*}$args < $in > $out 2> $err} message options]} {
+            set code [dict get $options -errorcode]
+            set status [expr {[lindex $code 0] eq "CHILDSTATUS" ? [lindex $code 2] : $message}]
+        }
+        list $status [getText $out] [getText $err]
+    }
+    proc manager {args} {
+        variable host
+        variable cli
+        variable work
+        run $work "" $host $cli {*}$args
+    }
+    proc fresh {} {
+        variable work
+        variable count
+        set path [file join $work dir[incr count]]
+        file mkdir $path
+        return $path
+    }
+    proc newEnvironment {{name env}} {
+        set path [file join [fresh] $name]
+        lassign [manager create $path] status out err
+        if {$status != 0} { error "create failed: $err" }
+        return $path
+    }
+    # Sources activate from shell with a prompt, and prints the prompt as
+    # the shell shows it: bash's own expansion; dash and busybox expand
+    # parameters and command substitutions in PS1, as eval does.
+    proc shownPrompt {shell environment} {
+        set directory [file dirname $environment]
+        if {$shell eq "bash"} {
+            set show {printf '%s' "${PS1@P}"}
+            set command [list bash --norc --noprofile]
+        } else {
+            set show {eval "shown=\"$PS1\""; printf '%s' "$shown"}
+            set command [expr {$shell eq "busybox" ? {busybox sh} : {dash}}]
+        }
+        set script "PS1='> '\n. \"\$1/bin/activate\"\n$show\n"
+        run $directory "" {*}$command -c $script sh $environment
+    }
+    proc pwned {environment} { file exists [file join [file dirname $environment] PWNED] }
+
+    # 1. The environment's name is never evaluated by the prompt.
+    foreach shell {dash bash busybox} {
+        test prompt-1.$shell "$shell shows the name in the prompt and never runs it" -constraints $shell -body {
+            set name {$(touch PWNED)`touch PWNED`x}
+            set environment [newEnvironment $name]
+            lassign [shownPrompt $shell $environment] status out err
+            list $status [expr {$out eq "($name) > "}] [pwned $environment] $err
+        } -result {0 1 0 {}}
+    }
+    test prompt-1.escapes {bash shows prompt escapes in the name as written} -constraints bash -body {
+        set name {e\u\w\$%}
+        set environment [newEnvironment $name]
+        lassign [shownPrompt bash $environment] status out err
+        list $status [expr {$out eq "($name) > "}]
+    } -result {0 1}
+    test prompt-1.restored {deactivate restores the prompt and removes the name variable} -constraints dash -body {
+        set environment [newEnvironment]
+        set script {PS1='> '; . "$1/bin/activate"; deactivate; printf '%s|%s' "$PS1" "${_TCLVENV_PROMPT-unset}"}
+        run [file dirname $environment] "" dash -c $script sh $environment
+    } -result {0 {> |unset} {}}
+
+    # 2. Launchers reached through symbolic links find their environment.
+    proc linkedRun {kind} {
+        set environment [newEnvironment]
+        set links [fresh]
+        set target [file join $environment bin tclsh]
+        switch -- $kind {
+            absolute { file link -symbolic [file join $links my\ tcl] $target; set launcher [file join $links my\ tcl] }
+            relative {
+                run $links "" ln -s -- [file join .. [file tail [file dirname $environment]] env bin tclsh] my-tcl
+                set launcher [file join $links my-tcl]
+            }
+            chain {
+                file link -symbolic [file join $links first] $target
+                file link -symbolic [file join $links second] [file join $links first]
+                set launcher [file join $links second]
+            }
+            path {
+                file link -symbolic [file join $links ptcl] $target
+                return [run $links {puts [list stdin $argv]} env PATH=$links:$::env(PATH) ptcl - a]
+            }
+        }
+        run $links {puts [list stdin $argv]} $launcher - a
+    }
+    foreach kind {absolute relative chain path} {
+        test launcher-2.$kind "bin/tclsh through a $kind link" -constraints unix -body {
+            linkedRun $kind
+        } -result [list 0 "stdin {- a}\n" {}]
+    }
+    test launcher-2.tclvenv {bin/tclvenv through a link} -constraints unix -body {
+        set environment [newEnvironment]
+        set link [file join [fresh] tv]
+        file link -symbolic $link [file join $environment bin tclvenv]
+        lassign [run [file dirname $link] "" $link info $environment] status out err
+        list $status [string match "*[file tail $environment]*" $out] $err
+    } -result {0 1 {}}
+    # 3. Another tool's deactivate survives; tclvenv_deactivate always works.
+    test deactivate-3.foreign {an existing deactivate is kept} -constraints dash -body {
+        set environment [newEnvironment]
+        set script {deactivate () { echo theirs; }
+            P0=$PATH; . "$1/bin/activate"; tclvenv_deactivate
+            deactivate; [ "$PATH" = "$P0" ] && echo restored
+            command -v tclvenv_deactivate || echo gone}
+        run [file dirname $environment] "" dash -c $script sh $environment
+    } -result [list 0 "theirs\nrestored\ngone\n" "tclvenv: deactivate belongs to another tool here; leave this environment with tclvenv_deactivate\n"]
+    test deactivate-3.own {without another tool, deactivate leaves and is removed} -constraints dash -body {
+        set environment [newEnvironment]
+        set script {. "$1/bin/activate"; deactivate; command -v deactivate || echo gone}
+        run [file dirname $environment] "" dash -c $script sh $environment
+    } -result [list 0 "gone\n" {}]
+    proc pythonVenv {} {
+        set directory [fresh]
+        lassign [run $directory "" python3 -m venv pyv] status
+        if {$status != 0} { return "" }
+        return [file join $directory pyv]
+    }
+    test deactivate-3.python-inside {a tclvenv inside a Python venv: both can be left} -constraints {bash python3} -body {
+        set environment [newEnvironment]
+        set python [pythonVenv]
+        if {$python eq ""} { return skipped }
+        set script {P0=$PATH; . "$2/bin/activate"; . "$1/bin/activate"
+            tclvenv_deactivate; echo "tclvenv=${TCLVENV-unset}"
+            deactivate; echo "venv=${VIRTUAL_ENV-unset}"; [ "$PATH" = "$P0" ] && echo restored}
+        lrange [run [file dirname $environment] "" bash --norc --noprofile -c $script sh $environment $python] 0 1
+    } -result [list 0 "tclvenv=unset\nvenv=unset\nrestored\n"]
+    test deactivate-3.python-outside {a Python venv inside a tclvenv: both can be left} -constraints {bash python3} -body {
+        set environment [newEnvironment]
+        set python [pythonVenv]
+        if {$python eq ""} { return skipped }
+        set script {P0=$PATH; . "$1/bin/activate"; . "$2/bin/activate"
+            echo "active=${TCLVENV##*/}"
+            deactivate; echo "venv=${VIRTUAL_ENV-unset}"
+            tclvenv_deactivate; echo "tclvenv=${TCLVENV-unset}"; [ "$PATH" = "$P0" ] && echo restored}
+        lrange [run [file dirname $environment] "" bash --norc --noprofile -c $script sh $environment $python] 0 1
+    } -result [list 0 "active=env\nvenv=unset\ntclvenv=unset\nrestored\n"]
+
+    # 4. Export status is restored.
+    test export-4.unexported {an unexported TCLVENV stays unexported} -constraints dash -body {
+        set environment [newEnvironment]
+        set script {unset TCLVENV; TCLVENV=mine; . "$1/bin/activate"; deactivate
+            sh -c 'echo "child=${TCLVENV-unset}"'; echo "shell=$TCLVENV"}
+        run [file dirname $environment] "" dash -c $script sh $environment
+    } -result [list 0 "child=unset\nshell=mine\n" {}]
+    test export-4.exported {an exported TCLVENV stays exported} -constraints dash -body {
+        set environment [newEnvironment]
+        set script {TCLVENV=mine; export TCLVENV; . "$1/bin/activate"; deactivate
+            sh -c 'echo "child=${TCLVENV-unset}"'}
+        run [file dirname $environment] "" dash -c $script sh $environment
+    } -result [list 0 "child=mine\n" {}]
+
+    # 5. Activation runs no external command for the prompt.
+    test path-5.empty {an empty PATH, under set -e} -constraints dash -body {
+        set environment [newEnvironment]
+        set script {set -e; PS1='$ '; PATH=; . "$1/bin/activate"; eval "shown=\"$PS1\""; printf '%s' "$shown"}
+        run [file dirname $environment] "" dash -c $script sh $environment
+    } -result [list 0 {(env) $ } {}]
+    test path-5.unset {an unset PATH} -constraints dash -body {
+        set environment [newEnvironment]
+        set script {PS1='$ '; unset PATH; . "$1/bin/activate"; deactivate; echo "${PATH-unset}"}
+        run [file dirname $environment] "" dash -c $script sh $environment
+    } -result [list 0 "unset\n" {}]
+
+    # 6. A destination PATH can't hold is refused.
+    test create-6.colon {create refuses a path containing ':'} -constraints unix -body {
+        set path [file join [fresh] a:b]
+        lassign [manager create $path] status out err
+        list $status [string match {tclvenv: destination can't be activated (PATH can't hold a directory containing ":")*} $err] [file exists $path]
+    } -result {1 1 0}
+    test create-6.parent {a ':' in a parent directory is refused too} -constraints unix -body {
+        set path [file join [fresh] p:q env]
+        lindex [manager create $path] 0
+    } -result 1
+
+    # 8, 9. bin/tclsh matches native tclsh for argument forms and errors.
+    variable fixture [fresh]
+    putText [file join $fixture main.tcl] {puts [list script $argv [info script]]}
+    putText [file join $fixture -dash.tcl] {puts [list dashed $argv]}
+    putText [file join $fixture procerror.tcl] "proc f {} { error boom }\nf\n"
+    putText [file join $fixture toperror.tcl] "error \"top\\nsecond\"\n"
+    putText [file join $fixture syntax.tcl] "if \{1\} \{\n puts x\n"
+    putText [file join $fixture sourced.tcl] "set ch \[open inner.tcl w\]; puts \$ch {error inner}; close \$ch\nsource inner.tcl\n"
+    putText [file join $fixture returnerror.tcl] "return -code error -errorcode {A B} coded\n"
+    variable stdinProgram {puts [list stdin $argc $argv $tcl_interactive]}
+    variable tclEnvironment ""
+    proc compare {args} {
+        variable fixture
+        variable host
+        variable stdinProgram
+        variable tclEnvironment
+        if {$tclEnvironment eq ""} { set tclEnvironment [newEnvironment] }
+        set native [run $fixture $stdinProgram $host {*}$args]
+        set isolated [run $fixture $stdinProgram [file join $tclEnvironment bin tclsh] {*}$args]
+        if {$native eq $isolated} { return same }
+        return [list native $native environment $isolated]
+    }
+    foreach {name arguments} {
+        script {main.tcl a b}
+        dash {- a}
+        dash-script {-dash.tcl a}
+        option {--version}
+        lone-encoding {-encoding}
+        encoding-name {-encoding utf-8}
+        encoding-dash {-encoding utf-8 -dash.tcl x}
+        encoding-script {-encoding utf-8 main.tcl x}
+        encoding-unknown {-encoding no-such main.tcl}
+    } {
+        test args-8.$name "bin/tclsh $arguments as native tclsh" -constraints unix -body {
+            compare {*}$arguments
+        } -result same
+    }
+    test args-8.double-dash {-- still names a script that starts with -} -constraints unix -body {
+        variable fixture
+        lindex [run $fixture "" [file join [newEnvironment] bin tclsh] -- -dash.tcl a] 1
+    } -result "dashed a\n"
+    foreach name {procerror toperror syntax sourced missing} {
+        test trace-9.$name "a $name trace as native tclsh prints it" -constraints unix -body {
+            compare $name.tcl
+        } -result same
+    }
+    test trace-9.top-level-return {a top-level return -code error: the message, no launcher frames} -constraints unix -body {
+        variable fixture
+        variable host
+        variable tclEnvironment
+        compare main.tcl
+        lassign [run $fixture "" $host returnerror.tcl] nStatus - nErr
+        lassign [run $fixture "" [file join $tclEnvironment bin tclsh] returnerror.tcl] iStatus - iErr
+        list $nStatus $iStatus [lindex [split $nErr \n] 0] [lindex [split $iErr \n] 0] \
+            [string first tclvenv::runtime $iErr]
+    } -result {1 1 coded coded -1}
+
+    cleanupTests
+}
+namespace delete ::shells

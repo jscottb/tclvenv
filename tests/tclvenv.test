@@ -1,0 +1,577 @@
+package require tcltest 2
+namespace import ::tcltest::*
+set project [file dirname [file dirname [file normalize [info script]]]]
+source [file join $project lib manager.tcl]
+set cli [file join $project tclvenv.tcl]
+set host [info nameofexecutable]
+set scratch [makeDirectory "tclvenv test's \$workspace-[pid]"]
+
+proc writeTestFile {path text} {
+    set ch [open $path w]
+    fconfigure $ch -encoding utf-8 -translation lf
+    puts -nonewline $ch $text
+    close $ch
+    return $path
+}
+
+proc manager {args} {
+    exec -- $::host $::cli {*}$args
+}
+
+proc restoreEnv {saved} {
+    foreach key [array names ::env] {
+        if {![dict exists $saved $key]} { unset ::env($key) }
+    }
+    dict for {key value} $saved { set ::env($key) $value }
+}
+
+proc newFixture {name {kind empty}} {
+    set ::caseRoot [file join $::scratch $name]
+    file mkdir $::caseRoot
+    set ::envdir [file join $::caseRoot {environment's $name}]
+    set ::packageDir [file join $::caseRoot greeting1.0]
+    set ::moduleFile [file join $::caseRoot salute-1.0.tm]
+    set ::app [file join $::caseRoot app.tcl]
+    set ::outside [file join $::caseRoot outside]
+    set ::installedModule [file join $::envdir modules salute-1.0.tm]
+    file mkdir $::packageDir $::outside
+    writeTestFile [file join $::packageDir pkgIndex.tcl] {
+        package ifneeded greeting 1.0 [list source [file join $dir greeting.tcl]]
+    }
+    writeTestFile [file join $::packageDir greeting.tcl] {
+        namespace eval greeting { proc hello {} { return hello } }
+        package provide greeting 1.0
+    }
+    writeTestFile [file join $::packageDir .data] hidden
+    writeTestFile $::moduleFile {package provide salute 1.0}
+    writeTestFile [file join $::outside leak-1.0.tm] {package provide leak 1.0}
+    writeTestFile [file join $::outside pkgIndex.tcl] {
+        package ifneeded leaked 1.0 {package provide leaked 1.0}
+    }
+    if {$kind ne "none"} { manager create $::envdir --tcl $::host }
+    if {$kind eq "packages"} {
+        manager install $::envdir $::packageDir
+        manager install $::envdir $::moduleFile
+    }
+}
+
+proc cleanupFixture {} {
+    if {[info exists ::caseRoot]} { ::tclvenv::deleteOwned $::caseRoot }
+}
+
+# These helpers transfer script arguments via a data file, avoiding Tcl exec's
+# own redirection syntax in the test harness as well as in the implementation.
+proc envEval {script {arguments {}}} {
+    writeTestFile $::app $script
+    set argfile [writeTestFile [file join $::caseRoot arguments.data] [dict create arguments [linsert $arguments 0 $::app]]]
+    exec -- $::host [file join $::envdir metadata runtime.tcl] --tclvenv-arguments-file $argfile
+}
+
+proc envStdin {input {mode --stdin}} {
+    exec -- $::host [file join $::envdir metadata runtime.tcl] $mode << $input
+}
+
+testConstraint unix [expr {$::tcl_platform(platform) eq "unix"}]
+testConstraint windows [expr {$::tcl_platform(platform) eq "windows"}]
+testConstraint tcl9 [expr {[auto_execok tclsh9.0] ne ""}]
+testConstraint tcl86 [expr {[auto_execok tclsh8.6] ne ""}]
+set powershell [auto_execok pwsh]
+if {$powershell eq ""} { set powershell [auto_execok powershell.exe] }
+testConstraint powershell [expr {$powershell ne ""}]
+
+test create-1.1 {environment creation and identity} -setup {
+    newFixture create-1.1 none
+} -body {
+    manager create $envdir --tcl $host
+    set cfg [::tclvenv::config $envdir]
+    list [dict get $cfg runtime version] [dict get $cfg system_packages] \
+        [file isfile [file join $envdir bin tclsh]]
+} -cleanup { cleanupFixture } -result [list [info patchlevel] 0 1]
+
+test create-1.2 {existing directories are never overwritten} -setup {
+    newFixture create-1.2
+} -body {
+    set marker [writeTestFile [file join $envdir marker] preserve]
+    set code [catch {manager create $envdir} result]
+    list $code [string match {*already exists*} $result] [file exists $marker]
+} -cleanup { cleanupFixture } -result {1 1 1}
+
+test create-1.3 {interpreter probe fails before creating a destination} -setup {
+    newFixture create-1.3 none
+} -body {
+    set target [file join $caseRoot nonexistent]
+    set code [catch {manager create $target --tcl TclExecutableThatDoesNotExist}]
+    list $code [file exists $target]
+} -cleanup { cleanupFixture } -result {1 0}
+
+test create-1.4 {creation lock prevents competing creators} -setup {
+    newFixture create-1.4 none
+    set blocked [file join $caseRoot locked-env]
+    writeTestFile $blocked.tclvenv-create.lock busy
+} -body {
+    catch {manager create $blocked} result
+    list [string match {*creation is locked*} $result] [file exists $blocked]
+} -cleanup {
+    file delete -- $blocked.tclvenv-create.lock
+    cleanupFixture
+} -result {1 0}
+
+test create-1.5 {concurrent creators leave one complete environment} -setup {
+    newFixture create-1.5 none
+} -body {
+    set concurrent [file join $caseRoot concurrent-env]
+    set command [list $host $cli create $concurrent]
+    set first [open [concat | $command [list 2>@1]] r]
+    set second [open [concat | $command [list 2>@1]] r]
+    read $first
+    read $second
+    set failures [expr {[catch {close $first}] + [catch {close $second}]}]
+    list $failures [dict get [::tclvenv::config $concurrent] format] \
+        [string match {*Runtime and installed files: OK*} [manager doctor $concurrent]]
+} -cleanup { cleanupFixture } -result {1 1 1}
+
+test runtime-2.1 {strict package and module search paths} -setup {
+    newFixture runtime-2.1
+} -body {
+    envEval {
+        puts [expr {$auto_path eq [list [file join $env(TCLVENV) lib] [info library]]}]
+        puts [expr {[llength [::tcl::tm::path list]] == 2}]
+        puts [expr {[lindex [split $env(PATH) $tcl_platform(pathSeparator)] 0] eq [file join $env(TCLVENV) bin]}]
+    }
+} -cleanup { cleanupFixture } -result "1\n1\n1"
+
+test runtime-2.2 {core autoloads and modules still work} -setup {
+    newFixture runtime-2.2
+} -body {
+    envEval {
+        puts [clock format 0 -gmt 1 -format %Y]
+        package require msgcat
+        puts [::msgcat::mc hello]
+    }
+} -cleanup { cleanupFixture } -result "1970\nhello"
+
+test runtime-2.3 {script argv0 argc argv info script and current directory} -setup {
+    newFixture runtime-2.3
+} -body {
+    set output [envEval {puts [list $argv0 $argc $argv [info script] [pwd] $tcl_interactive]} \
+        [list {} {with spaces} {a'b} {a\b} "snowman \u2603" {semi;colon}]]
+    list [expr {[lindex $output 0] eq $app}] [lindex $output 1] \
+        [lindex $output 2] [expr {[lindex $output 3] eq $app}] \
+        [expr {[lindex $output 4] eq [pwd]}] [lindex $output 5]
+} -cleanup { cleanupFixture } -result [list 1 6 [list {} {with spaces} {a'b} {a\b} "snowman \u2603" {semi;colon}] 1 1 0]
+
+test runtime-2.4 {top-level return matches tclsh script behavior} -setup {
+    newFixture runtime-2.4
+} -body {
+    envEval {puts before; return; error unreachable}
+} -cleanup { cleanupFixture } -result before
+
+test runtime-2.5 {script exit status passes through manager run} -setup {
+    newFixture runtime-2.5
+} -body {
+    writeTestFile $app {exit 23}
+    catch {manager run $envdir -- $app} result options
+    list [lindex [dict get $options -errorcode] 0] [lindex [dict get $options -errorcode] 2]
+} -cleanup { cleanupFixture } -result {CHILDSTATUS 23}
+
+test runtime-2.6 {script errors are reported and exit nonzero} -setup {
+    newFixture runtime-2.6
+} -body {
+    writeTestFile $app {error {application failed}}
+    catch {manager run $envdir -- $app} result options
+    list [string match {*application failed*} $result] [lindex [dict get $options -errorcode] 2]
+} -cleanup { cleanupFixture } -result {1 1}
+
+test runtime-2.7 {stdin handles multiple lines and multiline commands} -setup {
+    newFixture runtime-2.7
+} -body {
+    envStdin "set x {hello\nworld}\nputs \$x\nputs done"
+} -cleanup { cleanupFixture } -result "hello\nworld\ndone"
+
+test runtime-2.8 {stdin remains available to scripts} -setup {
+    newFixture runtime-2.8
+} -body {
+    writeTestFile $app {puts [read stdin]}
+    exec -- $host $cli run $envdir -- $app << "input data"
+} -cleanup { cleanupFixture } -result {input data}
+
+test runtime-2.9 {interactive evaluation and timers} -setup {
+    newFixture runtime-2.9
+} -body {
+    envStdin {after 1 {set ready yes}
+vwait ready
+set ready
+exit
+} --interactive
+} -cleanup { cleanupFixture } -match glob -result {% after#*% % yes
+% }
+
+test runtime-2.10 {literal exec metacharacters survive manager run} -setup {
+    newFixture runtime-2.10
+} -body {
+    writeTestFile $app {puts $argv}
+    set args [list {|} {|&} {>} {>file} {2>@1} {<file} {&} {}]
+    # Calling the Tcl procedure avoids interpreting the input in the harness.
+    set argfile [writeTestFile [file join $caseRoot run-args] [dict create arguments [linsert $args 0 $app]]]
+    set driver [writeTestFile [file join $caseRoot driver.tcl] {
+        source [lindex $argv 0]
+        set ch [open [lindex $argv 2]]
+        set arguments [dict get [read $ch] arguments]
+        close $ch
+        ::tclvenv::run [lindex $argv 1] $arguments
+    }]
+    exec -- $host $driver [file join $project lib manager.tcl] $envdir $argfile
+} -cleanup { cleanupFixture } -result [list {|} {|&} {>} {>file} {2>@1} {<file} {&} {}]
+
+test runtime-2.11 {manager stdin mode preserves pipe semantics} -setup {
+    newFixture runtime-2.11
+} -body {
+    exec -- $host $cli run $envdir -- --stdin << {puts [expr {20 + 22}]}
+} -cleanup { cleanupFixture } -result 42
+
+test isolation-3.1 {inherited global package paths are excluded} -setup {
+    newFixture isolation-3.1
+    set oldEnv [array get ::env]
+    set ::env(TCLLIBPATH) [list $outside]
+    set ::env(TCL8_6_TM_PATH) $outside
+    set ::env(TCL9_0_TM_PATH) $outside
+} -body {
+    envEval {
+        puts [catch {package require leaked}]
+        puts [catch {package require leak}]
+    }
+} -cleanup {
+    restoreEnv $oldEnv
+    cleanupFixture
+} -result "1\n1"
+
+test isolation-3.2 {system packages mode exposes normal package paths} -setup {
+    newFixture isolation-3.2 none
+    set systemEnv [file join $caseRoot system-env]
+    manager create $systemEnv --system-packages
+    set oldEnv [array get ::env]
+    set ::env(TCLLIBPATH) [list $outside]
+} -body {
+    writeTestFile $app {puts [package require leaked]}
+    manager run $systemEnv -- $app
+} -cleanup {
+    restoreEnv $oldEnv
+    cleanupFixture
+} -result 1.0
+
+test install-4.1 {indexed package directory and dotfiles} -setup {
+    newFixture install-4.1
+} -body {
+    manager install $envdir $packageDir
+    list [envEval {package require greeting; puts [greeting::hello]}] \
+        [file exists [file join $envdir lib greeting1.0 .data]]
+} -cleanup { cleanupFixture } -result {hello 1}
+
+test install-4.2 {single-file module} -setup {
+    newFixture install-4.2
+} -body {
+    manager install $envdir $moduleFile
+    envEval {puts [package require salute]}
+} -cleanup { cleanupFixture } -result 1.0
+
+test install-4.3 {installer does not execute package indexes} -setup {
+    newFixture install-4.3
+    set dangerous [file join $caseRoot dangerous]
+    file mkdir $dangerous
+    writeTestFile [file join $dangerous pkgIndex.tcl] {error {must not execute}}
+} -body {
+    string match {Installed *} [manager install $envdir $dangerous]
+} -cleanup {
+    cleanupFixture
+} -result 1
+
+test install-4.4 {duplicate installs fail without changing inventory} -setup {
+    newFixture install-4.4 packages
+} -body {
+    catch {manager install $envdir $moduleFile} result
+    list [string match {*already installed*} $result] [dict size [::tclvenv::installed $envdir]]
+} -cleanup { cleanupFixture } -result {1 2}
+
+test install-4.5 {reject recursive installation sources} -setup {
+    newFixture install-4.5 packages
+} -body {
+    list [catch {manager install $envdir $caseRoot}] [catch {manager install $envdir [file join $envdir lib greeting1.0]}]
+} -cleanup { cleanupFixture } -result {1 1}
+
+test install-4.6 {reject symlinks without copying external data} -constraints unix -setup {
+    newFixture install-4.6
+    set linked [file join $caseRoot linked]
+    file mkdir $linked
+    writeTestFile [file join $linked pkgIndex.tcl] {}
+    file link -symbolic [file join $linked escape] $moduleFile
+} -body {
+    catch {manager install $envdir $linked} result
+    list [string match {*symlinks*} $result] [file exists [file join $envdir lib linked]]
+} -cleanup { cleanupFixture } -result {1 0}
+
+test install-4.7 {mutation locks protect install and remove} -setup {
+    newFixture install-4.7 packages
+    writeTestFile [file join $envdir metadata mutation.lock] busy
+} -body {
+    list [catch {manager install $envdir $moduleFile}] [catch {manager remove $envdir salute@1.0}]
+} -cleanup {
+    file delete -- [file join $envdir metadata mutation.lock]
+    cleanupFixture
+} -result {1 1}
+
+test install-4.8 {namespace modules map to module subdirectories} -constraints unix -setup {
+    newFixture install-4.8
+    set nsModule [writeTestFile [file join $caseRoot ns::example-1.0.tm] {package provide ns::example 1.0}]
+} -body {
+    manager install $envdir $nsModule
+    envEval {puts [package require ns::example]}
+} -cleanup { cleanupFixture } -result 1.0
+
+test remove-5.1 {changed files prevent removal} -setup {
+    newFixture remove-5.1 packages
+    writeTestFile $installedModule {package provide salute 1.0; # modified}
+} -body {
+    catch {manager remove $envdir salute@1.0} result
+    list [string match {*changed*} $result] [file exists $installedModule]
+} -cleanup {
+    cleanupFixture
+} -result {1 1}
+
+test remove-5.2 {added files prevent directory removal} -setup {
+    newFixture remove-5.2 packages
+    set extra [writeTestFile [file join $envdir lib greeting1.0 extra] preserve]
+} -body {
+    catch {manager remove $envdir greeting1.0} result
+    list [string match {*changed*} $result] [file exists $extra]
+} -cleanup {
+    cleanupFixture
+} -result {1 1}
+
+test remove-5.3 {remove package and inventory entry} -setup {
+    newFixture remove-5.3 packages
+} -body {
+    manager remove $envdir salute@1.0
+    list [file exists $installedModule] [dict exists [::tclvenv::installed $envdir] salute@1.0] \
+        [envEval {puts [catch {package require salute}]}]
+} -cleanup { cleanupFixture } -result {0 0 1}
+
+test remove-5.4 {added empty directories also prevent removal} -setup {
+    newFixture remove-5.4 packages
+    set extraDir [file join $envdir lib greeting1.0 empty-extra]
+    file mkdir $extraDir
+} -body {
+    catch {manager remove $envdir greeting1.0} result
+    list [string match {*changed*} $result] [file isdirectory $extraDir]
+} -cleanup {
+    cleanupFixture
+} -result {1 1}
+
+test doctor-6.1 {doctor prints runtime and effective search paths} -setup {
+    newFixture doctor-6.1
+} -body {
+    string match {*Runtime and installed files: OK*Package paths:*Module paths:*} [manager doctor $envdir]
+} -cleanup { cleanupFixture } -result 1
+
+test doctor-6.2 {doctor detects changed runtime identity} -setup {
+    newFixture doctor-6.2
+    set cfg [::tclvenv::config $envdir]
+    set changed $cfg
+    dict set changed runtime version 0.0
+    ::tclvenv::writeData [file join $envdir tclvenv.cfg] $changed
+} -body {
+    catch {manager doctor $envdir} result
+    string match {*runtime changed*} $result
+} -cleanup {
+    cleanupFixture
+} -result 1
+
+test doctor-6.3 {launch refuses a runtime mismatch} -setup {
+    newFixture doctor-6.3
+    set cfg [::tclvenv::config $envdir]
+    set changed $cfg
+    dict set changed runtime version 0.0
+    ::tclvenv::writeData [file join $envdir tclvenv.cfg] $changed
+} -body {
+    catch {envEval {puts unreachable}} result
+    string match {*runtime changed*} $result
+} -cleanup {
+    cleanupFixture
+} -result 1
+
+test metadata-7.1 {metadata is parsed as data without evaluation} -setup {
+    newFixture metadata-7.1
+    set metadata [file join $envdir metadata installed.tcldata]
+    writeTestFile $metadata {[error injected]}
+} -body {
+    catch {manager list $envdir} result
+    expr {![string match {*tclvenv: injected*} $result]}
+} -cleanup {
+    cleanupFixture
+} -result 1
+
+test metadata-7.2 {ownership metadata cannot name an outside target} -setup {
+    newFixture metadata-7.2
+    set metadata [file join $envdir metadata installed.tcldata]
+    set original [::tclvenv::readData $metadata]
+    set changed $original
+    dict set changed escape [dict create target ../outside files {}]
+    ::tclvenv::writeData $metadata $changed
+} -body {
+    catch {manager remove $envdir escape} result
+    string match {*invalid installed-package target*} $result
+} -cleanup {
+    cleanupFixture
+} -result 1
+
+test metadata-7.3 {ownership metadata cannot name the entire package root} -setup {
+    newFixture metadata-7.3
+    set metadata [file join $envdir metadata installed.tcldata]
+    set original [::tclvenv::readData $metadata]
+    set changed $original
+    dict set changed escape [dict create target lib/. files {}]
+    ::tclvenv::writeData $metadata $changed
+} -body {
+    catch {manager remove $envdir escape} result
+    string match {*invalid installed-package target*} $result
+} -cleanup {
+    cleanupFixture
+} -result 1
+
+test launcher-8.1 {POSIX launcher handles spaces quotes and dollar signs} -constraints unix -setup {
+    newFixture launcher-8.1
+} -body {
+    writeTestFile $app {puts [list $argc $argv [file tail $env(TCLVENV)]]}
+    exec -- [file join $envdir bin tclsh] $app {two words} {a'b} {$literal}
+} -cleanup { cleanupFixture } -result [list 3 [list {two words} {a'b} {$literal}] {environment's $name}]
+
+test launcher-8.2 {POSIX launcher clears a stale TCL_LIBRARY} -constraints unix -setup {
+    newFixture launcher-8.2
+    set saved [array get ::env]
+    set ::env(TCL_LIBRARY) [file join $scratch missing-core]
+} -body {
+    writeTestFile $app {puts OK}
+    exec -- [file join $envdir bin tclsh] $app
+} -cleanup {
+    restoreEnv $saved
+    cleanupFixture
+} -result OK
+
+test launcher-8.3 {environment includes its own manager} -constraints unix -setup {
+    newFixture launcher-8.3
+} -body {
+    exec -- [file join $envdir bin tclvenv] --version
+} -cleanup { cleanupFixture } -result 0.1.0
+
+test launcher-8.4 {Windows batch launcher passes script arguments} -constraints windows -setup {
+    newFixture launcher-8.4
+} -body {
+    writeTestFile $app {puts [list $argc $argv]}
+    exec -- [file join $envdir bin tclsh.cmd] $app {two words} {a'b} {$literal}
+} -cleanup { cleanupFixture } -result [list 3 [list {two words} {a'b} {$literal}]]
+
+test launcher-8.5 {PowerShell launcher runs scripts with spaced paths} -constraints powershell -setup {
+    newFixture launcher-8.5
+} -body {
+    writeTestFile $app {puts [list $argc $argv]}
+    exec -- {*}$powershell -NoProfile -File [file join $envdir bin tclsh.ps1] $app {two words} {a'b}
+} -cleanup { cleanupFixture } -result [list 2 [list {two words} {a'b}]]
+
+test launcher-8.6 {selected executable path can contain shell metacharacters} -constraints unix -setup {
+    newFixture launcher-8.6 none
+} -body {
+    set aliased [file join $caseRoot {Tcl's $bin}]
+    file mkdir $aliased
+    set executable [file join $aliased tclsh]
+    file link -symbolic $executable $host
+    set aliasEnv [file join $caseRoot aliased-env]
+    manager create $aliasEnv --tcl $executable
+    writeTestFile $app {puts OK}
+    exec -- [file join $aliasEnv bin tclsh] $app
+} -cleanup { cleanupFixture } -result OK
+
+test activation-9.1 {POSIX activation restores existing state} -constraints unix -setup {
+    newFixture activation-9.1
+} -body {
+    exec sh -c {
+        PATH=/usr/bin:/bin; TCLVENV=previous; PS1='original> '
+        export PATH TCLVENV
+        . "$1/bin/activate"
+        [ "$TCLVENV" = "$1" ] || exit 11
+        [ "$(command -v tclsh)" = "$1/bin/tclsh" ] || exit 12
+        . "$1/bin/activate"
+        deactivate
+        [ "$PATH" = /usr/bin:/bin ] || exit 13
+        [ "$TCLVENV" = previous ] || exit 14
+        [ "$PS1" = 'original> ' ] || exit 15
+        printf OK
+    } sh $envdir
+} -cleanup { cleanupFixture } -result OK
+
+test activation-9.2 {POSIX activation restores unset root and prompt} -constraints unix -setup {
+    newFixture activation-9.2
+} -body {
+    exec sh -c {
+        unset TCLVENV PS1
+        . "$1/bin/activate"
+        deactivate
+        [ "${TCLVENV+x}" != x ] || exit 11
+        [ "${PS1+x}" != x ] || exit 12
+        printf OK
+    } sh $envdir
+} -cleanup { cleanupFixture } -result OK
+
+test activation-9.3 {PowerShell activation restores state across repeated activation} -constraints powershell -setup {
+    newFixture activation-9.3
+} -body {
+    set driver [writeTestFile [file join $caseRoot activation.ps1] {
+        param($Root)
+        $ErrorActionPreference = 'Stop'
+        $env:TCLVENV = 'previous'
+        $oldPath = $env:PATH
+        . (Join-Path $Root 'bin/Activate.ps1')
+        if ($env:TCLVENV -ne $Root) { throw 'activation failed' }
+        . (Join-Path $Root 'bin/Activate.ps1')
+        deactivate
+        if ($env:TCLVENV -ne 'previous' -or $env:PATH -ne $oldPath) { throw 'restore failed' }
+        Write-Output OK
+    }]
+    exec -- {*}$powershell -NoProfile -File $driver $envdir
+} -cleanup { cleanupFixture } -result OK
+
+test activation-9.4 {cmd.exe activation restores state across repeated activation} -constraints windows -setup {
+    newFixture activation-9.4
+} -body {
+    set driver [writeTestFile [file join $caseRoot activation.bat] {@echo off
+set "TCLVENV=previous"
+set "TEST_OLD_PATH=%PATH%"
+call "%~1\bin\activate.bat"
+if not "%TCLVENV%"=="%~1" exit /b 11
+call "%~1\bin\activate.bat"
+call "%~1\bin\deactivate.bat"
+if not "%TCLVENV%"=="previous" exit /b 12
+if not "%PATH%"=="%TEST_OLD_PATH%" exit /b 13
+echo OK
+}]
+    exec cmd.exe /d /c [file nativename $driver] [file nativename $envdir]
+} -cleanup { cleanupFixture } -result OK
+
+test versions-10.1 {manager can create and run an environment with Tcl 9} -constraints tcl9 -setup {
+    newFixture versions-10.1 none
+} -body {
+    set nine [file join $caseRoot tcl9env]
+    manager create $nine --tcl tclsh9.0
+    writeTestFile $app {puts [info tclversion]; puts [clock format 0 -gmt 1 -format %Y]}
+    exec -- [lindex [auto_execok tclsh9.0] 0] [file join $nine metadata runtime.tcl] $app
+} -cleanup { cleanupFixture } -result "9.0\n1970"
+
+test versions-10.2 {manager can create and run an environment with Tcl 8.6} -constraints tcl86 -setup {
+    newFixture versions-10.2 none
+} -body {
+    set eight [file join $caseRoot tcl86env]
+    manager create $eight --tcl tclsh8.6
+    writeTestFile $app {puts [info tclversion]; puts [clock format 0 -gmt 1 -format %Y]}
+    exec -- [lindex [auto_execok tclsh8.6] 0] [file join $eight metadata runtime.tcl] $app
+} -cleanup { cleanupFixture } -result "8.6\n1970"
+
+removeDirectory $scratch
+cleanupTests

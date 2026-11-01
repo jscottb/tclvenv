@@ -1,0 +1,322 @@
+package require tcltest 2
+namespace eval ::fuzztest {
+    namespace import ::tcltest::*
+    variable directory [file dirname [file normalize [info script]]]
+    source [file join $directory fuzz.tcl]
+    variable root [makeDirectory "fuzz-harness-[pid]"]
+    variable host [info nameofexecutable]
+    testConstraint unix [expr {$::tcl_platform(platform) eq "unix"}]
+
+    proc makeScript {name body} {
+        variable root
+        set path [file join $root $name.tcl]
+        ::fuzz::writeText $path $body
+        return $path
+    }
+
+    test fuzz-runner-1.1 {child exit status and stdout/stderr are captured independently} -body {
+        set child [makeScript status {puts stdout normal; puts stderr diagnostic; exit 7}]
+        set result [::fuzz::run [list $host $child] [file join $root status]]
+        list [dict get $result status] [dict get $result output] [dict get $result stderr] \
+            [dict get $result timedout] [dict get $result limited]
+    } -result [list 7 "normal\n" "diagnostic\n" 0 0]
+
+    test fuzz-runner-1.2 {closed output descriptors cannot defeat the child deadline} -body {
+        set ready [file join $root ready]
+        set child [makeScript hang {
+            set ch [open [lindex $argv 0] w]
+            puts $ch ready
+            close $ch
+            close stdout
+            close stderr
+            vwait ::never
+        }]
+        set result [::fuzz::run [list $host $child $ready] [file join $root hang] {} {} 500]
+        list [file isfile $ready] [dict get $result timedout] [dict get $result limited]
+    } -result {1 1 0}
+
+    test fuzz-runner-1.3 {stdout is capped and the runaway child is stopped} -body {
+        set child [makeScript stdout-limit {puts -nonewline [string repeat x 100000]; flush stdout; vwait ::never}]
+        set result [::fuzz::run [list $host $child] [file join $root stdout-limit] {} {} 2000 1024]
+        list [dict get $result limited] [dict get $result timedout] \
+            [string length [dict get $result output]] [file size [dict get $result log]]
+    } -result {1 0 1024 1024}
+
+    test fuzz-runner-1.4 {stderr has its own cap and retained logs are truncated} -body {
+        set child [makeScript stderr-limit {puts -nonewline stderr [string repeat e 100000]; flush stderr; vwait ::never}]
+        set result [::fuzz::run [list $host $child] [file join $root stderr-limit] {} {} 2000 1024]
+        list [dict get $result limited] [dict get $result timedout] \
+            [string length [dict get $result stderr]] [file size [dict get $result stderr_log]]
+    } -result {1 0 1024 1024}
+
+    test fuzz-runner-1.5 {timeouts terminate descendants as well as their supervisor} -constraints unix -setup {
+        set pidPath [file join $root descendant.pid]
+        set grandchild [makeScript grandchild {vwait ::never}]
+        set child [makeScript parent {
+            set pids [exec [info nameofexecutable] [lindex $argv 0] &]
+            set ch [open [lindex $argv 1] w]
+            puts $ch [lindex $pids 0]
+            close $ch
+            vwait ::never
+        }]
+    } -body {
+        set result [::fuzz::run [list $host $child $grandchild $pidPath] [file join $root descendants] {} {} 500]
+        set childPid [string trim [::fuzz::readBytes $pidPath]]
+        set alive 0
+        if {![catch {exec ps -p $childPid -o stat=} state]} {
+            set state [string trim $state]
+            # A terminated orphan can remain a zombie until init reaps it.
+            set alive [expr {$state ne "" && ![string match Z* $state]}]
+        }
+        list [dict get $result timedout] $alive
+    } -cleanup {
+        if {[file isfile $pidPath]} {
+            ::fuzz::killTree [list [string trim [::fuzz::readBytes $pidPath]]]
+        }
+    } -result {1 0}
+
+    test fuzz-transport-2.1 {shell transport preserves literal metacharacters and Unicode} -constraints unix -body {
+        set arguments [list {} {two words} {a'b"c} {$HOME} {[exit 77]} {;exit 77} {|} {>file} "\t\n\u2603"]
+        set child [makeScript arguments {fconfigure stdout -encoding utf-8 -translation lf; puts [list $argc $argv]}]
+        set words {}
+        foreach value [list $host $child {*}$arguments] { lappend words [::fuzz::shellWord $value] }
+        set shell [file join $root transport.sh]
+        ::fuzz::writeText $shell "#!/bin/sh\nexec [join $words { }]\n"
+        set result [::fuzz::run [list sh $shell] [file join $root transport]]
+        set data [string trimright [encoding convertfrom utf-8 [dict get $result output]] \n]
+        list [dict get $result status] [lindex $data 0] [::fuzz::sameList [lindex $data 1] $arguments]
+    } -result {0 9 1}
+
+    test fuzz-transport-2.2 {stdin bytes survive supervision and half-close without loss} -body {
+        set input "quotes ' \" \t\n\u2603\u0000end\r\n"
+        set child [makeScript input {
+            fconfigure stdin -encoding utf-8 -translation lf
+            fconfigure stdout -encoding utf-8 -translation lf
+            puts -nonewline [read stdin]
+        }]
+        set result [::fuzz::run [list $host $child] [file join $root input] $input]
+        list [dict get $result status] \
+            [expr {[dict get $result output] eq [encoding convertto utf-8 $input]}] \
+            [string length [dict get $result stderr]]
+    } -result {0 1 0}
+
+    test fuzz-replay-3.1 {a case's input is independent of preceding groups or cases} -body {
+        set previous $::fuzz::seed
+        try {
+            set ::fuzz::seed 20261030
+            set firstSeed [::fuzz::caseSeed argv 37]
+            set first {}
+            for {set i 0} {$i < 20} {incr i} { lappend first [::fuzz::word] }
+            ::fuzz::caseSeed config 999
+            for {set i 0} {$i < 100} {incr i} { ::fuzz::number 1000 }
+            set secondSeed [::fuzz::caseSeed argv 37]
+            set second {}
+            for {set i 0} {$i < 20} {incr i} { lappend second [::fuzz::word] }
+            list [expr {$firstSeed == $secondSeed}] [::fuzz::sameList $first $second]
+        } finally { set ::fuzz::seed $previous }
+    } -result {1 1}
+
+    test fuzz-replay-3.2 {dictionary mutation changes order without dropping or changing data} -body {
+        set data {}
+        for {set i 0} {$i < 50} {incr i} { dict set data "key $i" "value \u2603 $i" }
+        set changed 0
+        for {set i 0} {$i < 20} {incr i} {
+            ::fuzz::caseSeed ordering $i
+            set shuffled [::fuzz::shuffle $data]
+            if {[dict keys $shuffled] ne [dict keys $data]} { set changed 1 }
+            if {[lsort [dict keys $shuffled]] ne [lsort [dict keys $data]]} { error "keys changed" }
+            dict for {key value} $data {
+                if {[dict get $shuffled $key] ne $value} { error "value changed" }
+            }
+        }
+        set changed
+    } -result 1
+
+    test fuzz-replay-3.3 {appending new groups preserves all original case seeds} -body {
+        set previous $::fuzz::seed
+        try {
+            set ::fuzz::seed 20261030
+            set derived {}
+            foreach group {argv cli config inventory packages paths stdin ordering} {
+                lappend derived [::fuzz::caseSeed $group 37]
+            }
+            set derived
+        } finally { set ::fuzz::seed $previous }
+    } -result {2114084029 3697006190 982730783 2565391304 4146087289 1434058538 3014751963 294578308}
+
+    test fuzz-replay-3.4 {longer stateful plans preserve the same bounded operation prefix} -body {
+        ::fuzz::caseSeed lifecycle 17
+        set short [::fuzz::lifecyclePlan 12]
+        ::fuzz::caseSeed lifecycle 17
+        set long [::fuzz::lifecyclePlan 200]
+        foreach operation $long {
+            lassign $operation action slot
+            if {[llength $operation] != 2 || $action ni {install remove edit restore doctor list} ||
+                $slot < 0 || $slot > 3} { error "invalid lifecycle plan" }
+        }
+        list [llength $long] [::fuzz::sameList $short [lrange $long 0 11]]
+    } -result {200 1}
+
+    test fuzz-replay-3.5 {recorded replay commands retain nondefault sequence length and deadline} -body {
+        set previous [list $::fuzz::steps $::fuzz::timeout $::fuzz::seed]
+        try {
+            set ::fuzz::steps 87
+            set ::fuzz::timeout 5432
+            set ::fuzz::seed 42
+            set command [::fuzz::replayCommand lifecycle 23]
+            set options [::fuzz::options [lrange $command 2 end]]
+            list [dict get $options steps] [dict get $options timeout] [dict get $options seed] \
+                [dict get $options only] [dict get $options case]
+        } finally {
+            lassign $previous ::fuzz::steps ::fuzz::timeout ::fuzz::seed
+        }
+    } -result {87 5432 42 lifecycle 23}
+
+    foreach value {0 -1 201 text 1.5} {
+        test fuzz-options-4.invalid-$value {sequence lengths must be bounded integers} -body {
+            set code [catch {::fuzz::options [list --steps $value]} message]
+            list $code [string match {steps must be*} $message]
+        } -result {1 1}
+    }
+    foreach value {1 200} {
+        test fuzz-options-4.valid-$value {sequence length accepts both supported boundaries} -body {
+            dict get [::fuzz::options [list --steps $value]] steps
+        } -result $value
+    }
+
+    test fuzz-snapshot-5.1 {snapshots detect a symlink retargeted between identical files} -constraints unix -setup {
+        set directory [file join $root links]
+        file mkdir $directory
+        ::fuzz::writeBytes [file join $root first-target] same
+        ::fuzz::writeBytes [file join $root second-target] same
+        file link -symbolic [file join $directory link] [file join $root first-target]
+    } -body {
+        set before [::fuzz::tree $directory]
+        file delete -- [file join $directory link]
+        file link -symbolic [file join $directory link] [file join $root second-target]
+        ::fuzz::equalTree $before [::fuzz::tree $directory]
+    } -result 0
+
+    foreach {group index} {faults 9 boundaries 15 modes 90 modes 99 recovery 59} {
+        test fuzz-scenarios-6.$group-$index {extended scenarios exercise real application paths without harness artifacts} -body {
+            set report [file join $root report-$group-$index]
+            set result [::fuzz::run [list $host $::fuzz::self --seed 1 --only $group --case $index \
+                --report-dir $report] [file join $root scenario-$group-$index]]
+            set summary [::fuzz::readData [file join $report summary.tcldata]]
+            list [dict get $result status] [dict get $summary total] [dict get $summary failed] \
+                [dict get $summary timeouts] [dict get $summary output_limits]
+        } -result {0 1 0 0 0}
+    }
+
+    foreach {group index} {containment 0 ownership 3 interleavings 1 crashes 0} {
+        test fuzz-adversarial-7.$group {adversarial controls and hard-termination checks reject false positives} -body {
+            set report [file join $root adversarial-$group]
+            set result [::fuzz::run [list $host $::fuzz::self --seed 1 --only $group --case $index \
+                --report-dir $report] [file join $root adversarial-operation-$group]]
+            set summary [::fuzz::readData [file join $report summary.tcldata]]
+            list [dict get $result status] [dict get $summary total] [dict get $summary failed] \
+                [dict get $summary timeouts]
+        } -result {0 1 0 0}
+    }
+
+    foreach {group index} {modulegrammar 1 completions 7} {
+        test fuzz-compatibility-8.$group {black-box compatibility controls accept ordinary input} -body {
+            set report [file join $root compatibility-$group]
+            set result [::fuzz::run [list $host $::fuzz::self --seed 1 --only $group --case $index \
+                --report-dir $report] [file join $root compatibility-operation-$group]]
+            set summary [::fuzz::readData [file join $report summary.tcldata]]
+            list [dict get $result status] [dict get $summary total] [dict get $summary failed]
+        } -result {0 1 0}
+    }
+
+    # Hostile groups: controls that pass with ordinary results. (These seed-1
+    # cases are a working runtime wrapper, garbage output, a module, a hostile
+    # removal ID, a directory name, a mutation, concurrent operations, a killed
+    # removal and a stdin program both interpreters run alike.)
+    foreach {group index} {names 0 names 1 names 2 datafuzz 0 fakeruntime 3 fakeruntime 10
+                           concurrency 0 killpoints 1 stdinmore 2} {
+        test fuzz-hostile-9.$group-$index {hostile groups accept ordinary outcomes} -constraints unix -body {
+            set report [file join $root hostile-$group-$index]
+            set result [::fuzz::run [list $host $::fuzz::self --seed 1 --only $group --case $index \
+                --report-dir $report] [file join $root hostile-operation-$group-$index] {} {} 60000]
+            set summary [::fuzz::readData [file join $report summary.tcldata]]
+            list [dict get $result status] [dict get $summary total] [dict get $summary failed] \
+                [dict get $summary timeouts]
+        } -result {0 1 0 0}
+    }
+
+    # The archives group (tests/fuzz_sources.tcl): seed-1 cases that pass
+    # with ordinary results.
+    foreach index {0 1 2 3} {
+        test fuzz-sources-1.archives-$index {the archives group accepts ordinary outcomes} -constraints unix -body {
+            set report [file join $root sources-archives-$index]
+            set result [::fuzz::run [list $host $::fuzz::self --seed 1 --only archives --case $index \
+                --report-dir $report] [file join $root sources-operation-$index] {} {} 60000]
+            set summary [::fuzz::readData [file join $report summary.tcldata]]
+            list [dict get $result status] [dict get $summary total] [dict get $summary failed] \
+                [dict get $summary timeouts]
+        } -result {0 1 0 0}
+    }
+
+    # The archive writers produce what the reader under test reads back.
+    test fuzz-sources-2.1 {fuzz tar and zip writers round-trip through the reader} -setup {
+        namespace eval ::tclvenv {}
+        source [file join $::fuzz::project lib archive.tcl]
+        set saved $::fuzz::current
+        set ::fuzz::current [dict create group archives]
+    } -cleanup {
+        set ::fuzz::current $saved
+    } -body {
+        set entries [list [::fuzz::archiveEntry p/pkgIndex.tcl file "index\n" method 8] \
+            [::fuzz::archiveEntry p/[string repeat n 120]/f file "long\n" method 0]]
+        set result {}
+        foreach bytes [list [::fuzz::tarArchive $entries] [::fuzz::zipArchive $entries]] {
+            set path [file join $root writer-[llength $result]]
+            ::fuzz::writeBytes $path $bytes
+            set out [file join $root writer-out-[llength $result]]
+            file mkdir $out
+            ::tclvenv::archive::extract $path $out
+            lappend result [::tclvenv::archive::entries $path] \
+                [::fuzz::readBytes [file join $out p [string repeat n 120] f]]
+        }
+        set result
+    } -result [list [list {p/pkgIndex.tcl file 6} [list p/[string repeat n 120]/f file 5]] "long\n" \
+                    [list {p/pkgIndex.tcl file 6} [list p/[string repeat n 120]/f file 5]] "long\n"]
+
+    # The hostile groups' oracles reject what they should.
+    proc hostileEnvironment {name} {
+        variable root
+        variable host
+        set environment [file join $root $name]
+        set source [file join $root $name-source pkg]
+        file mkdir $source
+        ::fuzz::writeText [file join $source pkgIndex.tcl] {}
+        ::fuzz::writeText [file join $source data] original
+        exec -- $host [file join $::fuzz::project tclvenv.tcl] create $environment
+        exec -- $host [file join $::fuzz::project tclvenv.tcl] install $environment $source
+        return $environment
+    }
+    test fuzz-hostile-10.1 {the independent check accepts a consistent environment} -body {
+        ::fuzz::independentProblems [hostileEnvironment consistent]
+    } -result {}
+    test fuzz-hostile-10.2 {the independent check notices a changed file and a stale lock} -body {
+        # (Not "env": in this namespace Tcl 8.6 would find the global array.)
+        set environment [hostileEnvironment inconsistent]
+        ::fuzz::writeText [file join $environment lib pkg data] changed
+        ::fuzz::writeText [file join $environment metadata mutation.lock] stale
+        ::fuzz::independentProblems $environment
+    } -result {{receipt pkg does not match its files} lock}
+    test fuzz-hostile-10.3 {a failure with a stack trace is not clean} -body {
+        set result [dict create status 1 stderr "tclvenv: oops\n    while executing\n\"x\""]
+        list [catch {::fuzz::cleanFailure $result command} message] $message \
+             [catch {::fuzz::cleanFailure [dict create status 1 stderr "tclvenv: oops\n"] command}] \
+             [catch {::fuzz::cleanFailure [dict create status 1 stderr "boom\n"] command} message] $message
+    } -result {1 {command printed a Tcl stack trace} 0 1 {command failed without a clean tclvenv: message}}
+    test fuzz-hostile-10.4 {tree differences are classified} -body {
+        ::fuzz::treeDiff {a {file x} b {file y} c directory} {a {file x} b {file z} d directory}
+    } -result {added d removed c changed b}
+
+    ::fuzz::cleanup $root
+    removeDirectory $root
+    cleanupTests
+}

@@ -1,0 +1,1028 @@
+package require tcltest 2
+# Package sources beyond a local directory: system packages (add,
+# available), archives (tar, tar.gz, zip) and URLs.
+namespace eval ::sources {
+    namespace import ::tcltest::*
+    variable project [file dirname [file dirname [file normalize [info script]]]]
+    source [file join $project lib manager.tcl]
+    variable host [info nameofexecutable]
+    variable cli [file join $project tclvenv.tcl]
+    variable work [makeDirectory "sources-[pid]"]
+    variable count 0
+    testConstraint unix [expr {$::tcl_platform(platform) eq "unix"}]
+
+    proc putBytes {path data} {
+        file mkdir [file dirname $path]
+        set ch [open $path wb]
+        try { puts -nonewline $ch $data } finally { close $ch }
+        return $path
+    }
+    proc getBytes {path} {
+        set ch [open $path rb]
+        try { read $ch } finally { close $ch }
+    }
+    # Runs the manager: {status stdout stderr}; environment sets variables.
+    proc manager {args} { managerWith {} {*}$args }
+    proc managerWith {environment args} {
+        variable host
+        variable cli
+        variable work
+        set in [putBytes [file join $work stdin] ""]
+        set out [file join $work out]
+        set err [file join $work err]
+        set saved {}
+        dict for {key value} $environment {
+            if {[info exists ::env($key)]} { dict set saved $key $::env($key) }
+            set ::env($key) $value
+        }
+        try {
+            set status 0
+            if {[catch {exec -- $host $cli {*}$args < $in > $out 2> $err} message options]} {
+                set code [dict get $options -errorcode]
+                set status [expr {[lindex $code 0] eq "CHILDSTATUS" ? [lindex $code 2] : $message}]
+            }
+        } finally {
+            dict for {key value} $environment {
+                unset -nocomplain ::env($key)
+                if {[dict exists $saved $key]} { set ::env($key) [dict get $saved $key] }
+            }
+        }
+        list $status [getBytes $out] [getBytes $err]
+    }
+    proc newEnvironment {} {
+        variable work
+        variable count
+        set path [file join $work env[incr count]]
+        lassign [manager create $path] status out err
+        if {$status != 0} { error "create failed: $err" }
+        return $path
+    }
+    proc fresh {} {
+        variable work
+        variable count
+        set path [file join $work dir[incr count]]
+        file mkdir $path
+        return $path
+    }
+    # Runs a script in the environment: its stdout, or an error.
+    proc inEnv {environment script} {
+        variable work
+        set in [putBytes [file join $work script.tcl] $script]
+        exec -- [file join $environment bin tclsh] $in 2>@1
+    }
+    proc ids {environment} {
+        lassign [manager list $environment] status out
+        lsort [lmap line [split [string trim $out] \n] {lindex [split $line \t] 0}]
+    }
+    proc libContents {environment} {
+        lsort [lmap path [glob -nocomplain -directory [file join $environment lib] -tails *] {set path}]
+    }
+    proc receipts {environment} {
+        ::tclvenv::readData [file join $environment metadata installed.tcldata]
+    }
+
+    # A package directory base/dir: name version, requiring requires, its
+    # script ending with extra.
+    proc sysPackage {base dir name version {requires {}} {extra {}}} {
+        set script ""
+        foreach required $requires { append script "package require $required\n" }
+        append script "package provide $name $version\n$extra\n"
+        putBytes [file join $base $dir $name.tcl] $script
+        putBytes [file join $base $dir pkgIndex.tcl] \
+            "package ifneeded $name $version \[list source \[file join \$dir $name.tcl\]\]\n"
+    }
+
+    # --- Archive writers (independent of the reader under test) ----------
+
+    proc tarField {value width} {
+        set text [format %0*o [expr {$width - 1}] $value]
+        return $text\0
+    }
+    # entries: {name type data ?mode?}; type 0 file, 5 directory, 2 link...
+    proc tarHeader {name type size {mode 0o644} {link ""}} {
+        set name [encoding convertto utf-8 $name]
+        set header [binary format a100a8a8a8a12a12a8a1a100a6a2a32a32a8a8a155a12 \
+            $name [tarField $mode 8] [tarField 0 8] [tarField 0 8] \
+            [tarField $size 12] [tarField 0 12] "        " $type $link \
+            ustar\0 00 "" "" "" "" "" ""]
+        binary scan $header cu* bytes
+        set sum 0
+        foreach byte $bytes { incr sum $byte }
+        string replace $header 148 155 [format %06o $sum]\0\x20
+    }
+    proc tarBytes {entries} {
+        set out ""
+        foreach entry $entries {
+            lassign $entry name type data mode link
+            if {$mode eq ""} { set mode 0o644 }
+            append out [tarHeader $name $type [string length $data] $mode $link]
+            append out $data [string repeat \0 [expr {(512 - [string length $data] % 512) % 512}]]
+        }
+        append out [string repeat \0 1024]
+    }
+    proc zipBytes {entries {method 8}} {
+        set out ""
+        set central ""
+        foreach entry $entries {
+            lassign $entry name data mode
+            set name [encoding convertto utf-8 $name]
+            if {$mode eq ""} { set mode [expr {[string match */ $name] ? 0o40755 : 0o100644}] }
+            set crc [zlib crc32 $data]
+            if {$method == 8} { set packed [zlib deflate $data] } else { set packed $data }
+            set offset [string length $out]
+            append out [binary format a4sssssiiiss PK\x03\x04 20 0x800 $method 0 0 \
+                $crc [string length $packed] [string length $data] [string length $name] 0] $name $packed
+            append central [binary format a4ccsssssiiisssssii PK\x01\x02 20 3 20 0x800 $method 0 0 \
+                $crc [string length $packed] [string length $data] [string length $name] 0 0 0 0 \
+                [expr {$mode << 16}] $offset] $name
+        }
+        set start [string length $out]
+        append out $central [binary format a4ssssiis PK\x05\x06 0 0 [llength $entries] [llength $entries] \
+            [string length $central] $start 0]
+    }
+    proc demoFiles {prefix {name sdemo} {requires {}}} {
+        set script ""
+        foreach required $requires { append script "package require $required\n" }
+        append script "package provide $name 1.0\nproc ${name}::hello {} {return hello}\nnamespace eval $name {}\n"
+        set script "namespace eval $name {}\n$script"
+        list $prefix/pkgIndex.tcl "package ifneeded $name 1.0 \[list source \[file join \$dir $name.tcl\]\]\n" \
+             $prefix/$name.tcl $script
+    }
+    proc tarOf {files} {
+        set dirs {}
+        set entries {}
+        foreach {path data} $files {
+            set dir [file dirname $path]
+            if {$dir ne "." && $dir ni $dirs} { lappend dirs $dir; lappend entries [list $dir/ 5 ""] }
+            lappend entries [list $path 0 $data]
+        }
+        tarBytes $entries
+    }
+    proc zipOf {files {method 8}} {
+        set entries {}
+        foreach {path data} $files { lappend entries [list $path $data] }
+        zipBytes $entries $method
+    }
+
+    # --- In-process: the archive reader -----------------------------------
+
+    test archive-names {entry names: unsafe ones refused, . dropped} -body {
+        set result {}
+        foreach name {a/b ./a/./b a//b ../x a/../b /etc/x C:/x c:x a\\b "" . a\0b} {
+            lappend result [expr {[catch {::tclvenv::archive::components $name} parts] ? "refused" : $parts}]
+        }
+        set result
+    } -result {{a b} {a b} {a b} refused refused refused refused refused refused refused refused refused}
+
+    test archive-kinds {kinds come from the bytes, not the name} -body {
+        set dir [fresh]
+        list [::tclvenv::archive::kind [putBytes $dir/a.zip [tarOf [demoFiles p]]]] \
+             [::tclvenv::archive::kind [putBytes $dir/b.tar [zipOf [demoFiles p]]]] \
+             [::tclvenv::archive::kind [putBytes $dir/c [zlib gzip [tarOf [demoFiles p]]]]] \
+             [::tclvenv::archive::kind [putBytes $dir/d.zip "not an archive"]]
+    } -result {tar zip gzip {}}
+
+    test archive-roundtrip {tar, tar.gz and zip (deflated, stored) give the written files} -body {
+        set dir [fresh]
+        set files [list a/x.tcl "x\n" a/b/y.bin [string repeat \x00\xff 70000] z "" \
+            a/\u00e9\u4e2d.tcl "unicode\n"]
+        set result {}
+        foreach {name data} [list t.tar [tarOf $files] t.tgz [zlib gzip [tarOf $files]] \
+                                  d.zip [zipOf $files 8] s.zip [zipOf $files 0]] {
+            set out [file join $dir out-$name]
+            file mkdir $out
+            ::tclvenv::archive::extract [putBytes [file join $dir $name] $data] $out
+            set same 1
+            foreach {path content} $files {
+                if {[getBytes [file join $out $path]] ne $content} { set same 0 }
+            }
+            lappend result $same
+        }
+        set result
+    } -result {1 1 1 1}
+
+    test archive-modes {executable bit kept, setuid and group/other write dropped} -constraints unix -body {
+        set dir [fresh]
+        set out [file join $dir out]
+        file mkdir $out
+        ::tclvenv::archive::extract [putBytes $dir/m.tar [tarBytes {
+            {run 0 x 0o6777} {plain 0 y 0o666}
+        }]] $out
+        list [format %o [file attributes $out/run -permissions]] [format %o [file attributes $out/plain -permissions]]
+    } -result {755 644}
+
+    # Each hostile archive is refused before anything is written.
+    foreach {label bytes pattern} [list \
+        traversal [tarBytes {{../escape 0 x}}] {*unsafe archive entry*} \
+        absolute [tarBytes {{/tmp/escape 0 x}}] {*unsafe archive entry*} \
+        nested-traversal [tarBytes {{a/../../escape 0 x}}] {*unsafe archive entry*} \
+        symlink [tarBytes {{good 0 x} {link 2 "" 0o777 /etc/passwd}}] {*links and special files*} \
+        hardlink [tarBytes {{link 1 "" 0o644 good}}] {*links and special files*} \
+        device [tarBytes {{dev 3 ""}}] {*links and special files*} \
+        duplicate [tarBytes {{a 0 x} {./a 0 y}}] {*duplicate archive entry*} \
+        file-and-directory [tarBytes {{a 0 x} {a/b 0 y}}] {*both a file and a directory*} \
+        truncated [string range [tarBytes {{a 0 0123456789}}] 0 515] {*truncated tar*} \
+        bad-checksum [string replace [tarBytes {{a 0 x}}] 0 0 b] {*checksum*} \
+        zip-traversal [zipBytes {{../escape x}}] {*unsafe archive entry*} \
+        zip-symlink [zipBytes [list [list link /etc/passwd 0o120777]]] {*links and special files*} \
+        zip-bad-crc [string map [list hello jello] [zipBytes {{a hello}} 0]] {*CRC*} \
+        zip64 [string replace [zipBytes {{a x}}] end-13 end-10 \xff\xff\xff\xff] {*zip64*} \
+        zip-truncated [string range [zipBytes {{a x}}] 0 10] {*not a zip*} \
+        gzip-corrupt [string range [zlib gzip [tarBytes {{a 0 x}}]] 0 20] {*compressed data*} \
+    ] {
+        test archive-refuse-$label "a hostile archive ($label) writes nothing" -body {
+            set dir [fresh]
+            set out [file join $dir out]
+            file mkdir $out
+            set refused [catch {::tclvenv::archive::extract [putBytes $dir/hostile $bytes] $out} message]
+            list $refused [string match $pattern $message] [glob -nocomplain -directory $out *] \
+                [file exists $dir/escape]
+        } -result {1 1 {} 0}
+    }
+
+    test archive-bomb {decompression stops at the size limit} -body {
+        set dir [fresh]
+        set out [file join $dir out]
+        file mkdir $out
+        set ::env(TCLVENV_ARCHIVE_LIMIT) 100000
+        try {
+            list [catch {::tclvenv::archive::extract [putBytes $dir/bomb.tgz \
+                [zlib gzip [tarBytes [list [list big 0 [string repeat \0 5000000]]]]]] $out} message] $message
+        } finally { unset ::env(TCLVENV_ARCHIVE_LIMIT) }
+    } -result {1 {archive expands beyond the size limit}}
+
+    test archive-zip-bomb {a zip entry larger than the limit is refused before inflating} -body {
+        set dir [fresh]
+        set ::env(TCLVENV_ARCHIVE_LIMIT) 100000
+        try {
+            list [catch {::tclvenv::archive::entries [putBytes $dir/bomb.zip \
+                [zipBytes [list [list big [string repeat \0 5000000]]]]]} message] $message
+        } finally { unset ::env(TCLVENV_ARCHIVE_LIMIT) }
+    } -result {1 {archive expands beyond the size limit}}
+
+    test archive-zip-lying-size {a deflated entry bigger than its declared size is refused} -body {
+        set dir [fresh]
+        set bytes [zipBytes {{a hello}} 8]
+        # Declared uncompressed size 2 in both headers: inflating gives 5.
+        set at [string first PK\x01\x02 $bytes]
+        set bytes [string replace $bytes [expr {$at + 24}] [expr {$at + 27}] [binary format i 2]]
+        set bytes [string replace $bytes 22 25 [binary format i 2]]
+        set out [file join $dir out]
+        file mkdir $out
+        list [catch {::tclvenv::archive::extract [putBytes $dir/lie.zip $bytes] $out} message] $message \
+            [glob -nocomplain -directory $out *]
+    } -result {1 {corrupt zip entry (size): a} {}}
+
+    testConstraint tarCommand [expr {[auto_execok tar] ne ""}]
+    testConstraint procStatus [file readable /proc/self/status]
+
+    test archive-dot-root {an archive made from "." (./, ./x) extracts; only the root is skipped} -body {
+        set dir [fresh]
+        set result {}
+        foreach {name bytes} [list t.tar [tarBytes {{./ 5 ""} {./pkgIndex.tcl 0 x} {./sub/ 5 ""} {./sub/a 0 y} {./. 5 ""}}] \
+                                   z.zip [zipBytes {{./ ""} {./pkgIndex.tcl x} {./sub/a y}}]] {
+            set out [file join $dir out-$name]
+            file mkdir $out
+            ::tclvenv::archive::extract [putBytes [file join $dir $name] $bytes] $out
+            lappend result [lsort [glob -tails -directory $out * */*]] [getBytes $out/sub/a]
+        }
+        # A file named "." or "./" is still refused.
+        lappend result [catch {::tclvenv::archive::extract [putBytes $dir/f.tar [tarBytes {{./ 0 x}}]] [fresh]}]
+    } -result {{pkgIndex.tcl sub sub/a} y {pkgIndex.tcl sub sub/a} y 1}
+
+    test install-archive-dot-root {a release packed with "tar -C dir ." installs} -constraints tarCommand -body {
+        set dir [fresh]
+        foreach {path data} [demoFiles .] { putBytes [file join $dir src $path] $data }
+        exec tar -C [file join $dir src] -czf [file join $dir sdemo-2.0.tar.gz] .
+        set environment [newEnvironment]
+        lassign [manager install $environment [file join $dir sdemo-2.0.tar.gz]] status out err
+        list $status $err [ids $environment] [inEnv $environment {puts [package require sdemo]}]
+    } -result {0 {} sdemo-2.0 1.0}
+
+    test archive-tar-no-end {a tar cut short at an entry boundary is refused, not partly extracted} -body {
+        set dir [fresh]
+        set out [file join $dir out]
+        file mkdir $out
+        set bytes [string range [tarBytes {{pkgIndex.tcl 0 x} {more.tcl 0 y}}] 0 end-1024]
+        set cut [string range $bytes 0 1023]
+        list [catch {::tclvenv::archive::extract [putBytes $dir/a.tar $bytes] $out} m1] $m1 \
+             [catch {::tclvenv::archive::extract [putBytes $dir/b.tgz [zlib gzip $cut]] $out} m2] $m2 \
+             [glob -nocomplain -directory $out *]
+    } -result {1 {truncated tar archive (no end-of-archive marker)} 1 {truncated tar archive (no end-of-archive marker)} {}}
+
+    test install-archive-truncated {installing a truncated tar changes nothing} -body {
+        set dir [fresh]
+        set bytes [tarOf [concat [demoFiles sdemo1.0] {sdemo1.0/extra.tcl "extra\n"}]]
+        set environment [newEnvironment]
+        lassign [manager install $environment [putBytes $dir/sdemo1.0.tar [string range $bytes 0 2047]]] status - err
+        list $status [string match *truncated* $err] [ids $environment] [libContents $environment]
+    } -result {1 1 {} {}}
+
+    test archive-gzip-members {every member of a multi-member gzip is read, at any boundary} -body {
+        set dir [fresh]
+        set files {}
+        foreach i {1 2 3 4} {
+            set data ""
+            for {set j 0} {$j < 20000 * $i} {incr j} { append data [binary format c [expr {($j * 7919 + $i) % 256}]] }
+            lappend files f$i $data
+        }
+        set stream [tarOf $files]
+        set result {}
+        # Splits at several places, including one putting a member's
+        # trailer across the reader's 64 KiB pieces.
+        foreach split [list 1 512 1000 [expr {[string length $stream] / 2}] 65480 65510 65526 65530] {
+            set bytes [zlib gzip [string range $stream 0 $split-1]][zlib gzip [string range $stream $split end]]
+            set out [file join $dir out-$split]
+            file mkdir $out
+            ::tclvenv::archive::extract [putBytes $dir/m-$split.tgz $bytes] $out
+            set same 1
+            foreach {name data} $files { if {[getBytes $out/$name] ne $data} { set same 0 } }
+            lappend result $same
+        }
+        set three [zlib gzip [string range $stream 0 99]][zlib gzip [string range $stream 100 199]][zlib gzip [string range $stream 200 end]]
+        set out [file join $dir out-three]
+        file mkdir $out
+        ::tclvenv::archive::extract [putBytes $dir/three.tgz $three\0\0\0\0] $out
+        lappend result [expr {[getBytes $out/f4] eq [lindex $files 7]}]
+        lappend result [catch {::tclvenv::archive::extract [putBytes $dir/junk.tgz [zlib gzip $stream]junk] [fresh]} message] $message
+    } -result {1 1 1 1 1 1 1 1 1 1 {corrupt compressed data: data after the gzip data}}
+
+    test archive-cleanup {data found corrupt while copying removes what was written} -body {
+        set dir [fresh]
+        set out [file join $dir out]
+        file mkdir $out
+        set bytes [string map [list jello hello] [zipBytes {{a/first hello} {b/second jello}} 0]]
+        list [catch {::tclvenv::archive::extract [putBytes $dir/c.zip $bytes] $out} message] $message \
+            [glob -nocomplain -directory $out *]
+    } -result {1 {corrupt zip entry (CRC): b/second} {}}
+
+    test archive-memory {extraction streams: memory stays far below the archive's size} -constraints procStatus -body {
+        variable host
+        variable project
+        set dir [fresh]
+        set data ""
+        for {set i 0} {$i < 30 * 1024} {incr i} { append data [string repeat [format %08x [expr {$i * 2654435761 % 4294967296}]] 128] }
+        set result {}
+        foreach {name bytes} [list big.tgz [zlib gzip [tarOf [list p/pkgIndex.tcl x p/data $data]]] \
+                                   big.zip [zipOf [list p/pkgIndex.tcl x p/data $data] 0]] {
+            putBytes $dir/$name $bytes
+            set script [putBytes $dir/measure.tcl [string map [list @PROJECT@ $project] {
+                namespace eval ::tclvenv {}
+                source @PROJECT@/lib/archive.tcl
+                set out [lindex $argv 1]
+                file mkdir $out
+                ::tclvenv::archive::extract [lindex $argv 0] $out
+                set ch [open /proc/self/status]
+                regexp {VmHWM:\s+(\d+)} [read $ch] -> peak
+                close $ch
+                puts [list [file size $out/p/data] $peak]
+            }]]
+            lassign [exec $host $script $dir/$name $dir/out-$name] size peak
+            # 30 MiB of data; a whole copy in memory would show.
+            lappend result [expr {$size == [string length $data]}] [expr {$peak < 20 * 1024}]
+        }
+        set result
+    } -result {1 1 1 1}
+
+    # --- install from archives --------------------------------------------
+
+    test install-archive-kinds {tar, tar.gz, zip install, load and record their origin} -body {
+        set dir [fresh]
+        set result {}
+        foreach {name bytes} [list sdemo1.0.tar [tarOf [demoFiles sdemo1.0]] \
+                                   sdemo1.0.tgz [zlib gzip [tarOf [demoFiles sdemo1.0]]] \
+                                   sdemo1.0.zip [zipOf [demoFiles sdemo1.0]]] {
+            set environment [newEnvironment]
+            set archive [putBytes [file join $dir $name] $bytes]
+            lassign [manager install $environment $archive] status out err
+            set origin [dict get [receipts $environment] sdemo1.0 origin]
+            lappend result $status [inEnv $environment {puts [package require sdemo]:[sdemo::hello]}] \
+                [dict get $origin kind] [expr {[dict get $origin sha256] eq [::tclvenv::fileSha256 $archive]}]
+        }
+        set result
+    } -result {0 1.0:hello archive 1 0 1.0:hello archive 1 0 1.0:hello archive 1}
+
+    test install-archive-top-level {a package at the archive's top level is named after the archive} -body {
+        set dir [fresh]
+        set environment [newEnvironment]
+        lassign [manager install $environment [putBytes $dir/toplevel-2.zip [zipOf [demoFiles .]]]] status
+        list $status [ids $environment] [inEnv $environment {puts [package require sdemo]}]
+    } -result {0 toplevel-2 1.0}
+
+    test install-archive-nested {the single package directory a few levels down is found} -body {
+        set dir [fresh]
+        set environment [newEnvironment]
+        lassign [manager install $environment [putBytes $dir/n.tgz [zlib gzip [tarOf [demoFiles release/lib/sdemo1.0]]]]] status
+        list $status [ids $environment]
+    } -result {0 sdemo1.0}
+
+    test install-archive-several {several packages: an error naming them, then --subdir} -body {
+        set dir [fresh]
+        set environment [newEnvironment]
+        set archive [putBytes $dir/two.zip [zipOf [concat [demoFiles one1.0 sone] [demoFiles two1.0 stwo]]]]
+        lassign [manager install $environment $archive] status1 - err1
+        lassign [manager install $environment $archive --subdir two1.0] status2
+        lassign [manager install $environment $archive --subdir ../two1.0] status3 - err3
+        list $status1 [string match "*several packages*one1.0*two1.0*" $err1] $status2 [ids $environment] \
+            $status3 [string match *unsafe* $err3]
+    } -result {1 1 0 two1.0 1 1}
+
+    test install-archive-module {a .tm in an archive installs as a module} -body {
+        set dir [fresh]
+        set environment [newEnvironment]
+        lassign [manager install $environment [putBytes $dir/m.tar.gz [zlib gzip [tarOf {
+            smod-1.2.tm "package provide smod 1.2\n"
+        }]]]] status out err
+        list $status [ids $environment] [inEnv $environment {puts [package require smod]}]
+    } -result {0 smod@1.2 1.2}
+
+    test install-archive-sha256 {--sha256 checked on local archives; bad values refused} -body {
+        set dir [fresh]
+        set environment [newEnvironment]
+        set archive [putBytes $dir/sdemo1.0.zip [zipOf [demoFiles sdemo1.0]]]
+        lassign [manager install $environment $archive --sha256 [string repeat 0 64]] s1 - e1
+        lassign [manager install $environment $archive --sha256 xyz] s2 - e2
+        lassign [manager install $environment $archive --sha256 [string toupper [::tclvenv::fileSha256 $archive]]] s3
+        list $s1 [string match *mismatch* $e1] $s2 [string match *hexadecimal* $e2] $s3 [ids $environment]
+    } -result {1 1 1 1 0 sdemo1.0}
+
+    test install-archive-hostile {a hostile archive leaves the environment unchanged} -body {
+        set dir [fresh]
+        set environment [newEnvironment]
+        set result {}
+        foreach bytes [list [tarBytes {{sdemo/pkgIndex.tcl 0 {}} {../../escape 0 x}}] \
+                            [tarBytes {{sdemo/pkgIndex.tcl 0 {}} {sdemo/l 2 "" 0o777 /etc}}] \
+                            [zipBytes {{sdemo/pkgIndex.tcl {}} {/abs x}}]] {
+            lassign [manager install $environment [putBytes $dir/h.tar $bytes]] status
+            lappend result $status
+        }
+        lappend result [ids $environment] [libContents $environment] [file exists [file join $work escape]]
+        lassign [manager doctor $environment] healthy
+        lappend result $healthy
+    } -result {1 1 1 {} {} 0 0}
+
+    test install-archive-no-package {an archive with no package is refused} -body {
+        set dir [fresh]
+        set environment [newEnvironment]
+        lassign [manager install $environment [putBytes $dir/x.zip [zipOf {readme "hi"}]]] status - err
+        list $status [string match "*no package directory*" $err] [ids $environment]
+    } -result {1 1 {}}
+
+    test install-archive-load-fails {a package that doesn't load is rolled back} -body {
+        set dir [fresh]
+        set environment [newEnvironment]
+        set archive [putBytes $dir/broken1.0.zip [zipOf {
+            broken1.0/pkgIndex.tcl "package ifneeded sbroken 1.0 {error {built for another Tcl}}\n"
+        }]]
+        lassign [manager install $environment $archive] status - err
+        lassign [manager install $environment $archive --no-check] status2
+        list $status [string match "*sbroken does not load*built for another Tcl*" $err] $status2 [ids $environment]
+    } -result {1 1 0 broken1.0}
+
+    # --- add and available: system packages -------------------------------
+
+    test add-dependencies {add installs what a package requires, dependencies first} -body {
+        set system [fresh]
+        sysPackage $system sbase1.0 sbase 1.0
+        sysPackage $system smid1.0 smid 1.0 sbase
+        sysPackage $system stop1.0 stop 1.0 {smid sbase}
+        set environment [newEnvironment]
+        lassign [manager add $environment stop --path $system] status out err
+        set order [regexp -all -inline {Installed (\S+)} $out]
+        list $status [lmap {- id} $order {set id}] [inEnv $environment {puts [package require stop]}] \
+            [dict get [receipts $environment] smid1.0 origin kind]
+    } -result {0 {sbase1.0 smid1.0 stop1.0} 1.0 system}
+
+    test add-no-deps {--no-deps installs only the package and names the rest} -body {
+        set system [fresh]
+        sysPackage $system sbase1.0 sbase 1.0
+        sysPackage $system stop1.0 stop 1.0 sbase
+        set environment [newEnvironment]
+        lassign [manager add $environment stop --path $system --no-deps --no-check] status out
+        list $status [ids $environment] [string match "*Not adding*sbase*" $out]
+    } -result {0 stop1.0 1}
+
+    test add-installed-dependency {a dependency already in the environment is not added again} -body {
+        set system [fresh]
+        sysPackage $system sbase1.0 sbase 1.0
+        sysPackage $system stop1.0 stop 1.0 sbase
+        set environment [newEnvironment]
+        manager add $environment sbase --path $system
+        lassign [manager add $environment stop --path $system] status out
+        list $status [ids $environment] [regexp -all {Installed} $out]
+    } -result {0 {sbase1.0 stop1.0} 1}
+
+    test add-collection {a Tcllib-style collection: only the module's own directory is copied} -body {
+        set system [fresh]
+        sysPackage $system/scoll smoda smoda 1.0
+        sysPackage $system/scoll smodb smodb 1.0 smoda
+        putBytes $system/scoll/pkgIndex.tcl {
+            set maindir $dir
+            foreach sub {smoda smodb} {
+                set dir [file join $maindir $sub]
+                source [file join $dir pkgIndex.tcl]
+            }
+            unset maindir
+        }
+        set environment [newEnvironment]
+        lassign [manager add $environment smodb --path $system] status
+        list $status [ids $environment] [libContents $environment] [inEnv $environment {puts [package require smodb]}]
+    } -result {0 {smoda smodb} {smoda smodb} 1.0}
+
+    test add-version {VERSION chooses among versions; the newest without it} -body {
+        set system [fresh]
+        sysPackage $system sver1.0 sver 1.0
+        sysPackage $system sver2.0 sver 2.0
+        set first [newEnvironment]
+        set second [newEnvironment]
+        lassign [manager add $first sver 1.0 --path $system] s1
+        lassign [manager add $second sver --path $system] s2
+        list $s1 [ids $first] $s2 [ids $second]
+    } -result {0 sver1.0 0 sver2.0}
+
+    test add-load-fails {a package that loads on the system but not in the environment is rolled back} -body {
+        set system [fresh]
+        sysPackage $system sbase1.0 sbase 1.0
+        # Stands in for a binary built for another Tcl: fails in environments.
+        sysPackage $system sfail1.0 sfail 1.0 sbase \
+            {if {[info exists ::env(TCLVENV)]} { error "wrong Tcl" }}
+        set environment [newEnvironment]
+        lassign [manager add $environment sfail --path $system] status out err
+        lassign [manager doctor $environment] healthy
+        list $status [string match "*sfail does not load*wrong Tcl*" $err] [ids $environment] \
+            [libContents $environment] $healthy
+    } -result {1 1 {} {} 0}
+
+    test add-missing {an unknown package is an error and changes nothing} -body {
+        set environment [newEnvironment]
+        lassign [manager add $environment no_such_package_anywhere] status - err
+        list $status [string match "*can't find package no_such_package_anywhere*" $err] [ids $environment]
+    } -result {1 1 {}}
+
+    test add-root-refused {a package registered from a package-path root is refused} -body {
+        set system [fresh]
+        putBytes $system/pkgIndex.tcl "package ifneeded sroot 1.0 {package provide sroot 1.0}\n"
+        set environment [newEnvironment]
+        lassign [manager add $environment sroot --path $system] status - err
+        list $status [string match "*package-path root*" $err] [ids $environment]
+    } -result {1 1 {}}
+
+    test add-namespaced-module {a namespaced module keeps its namespace directory} -body {
+        set system [fresh]
+        putBytes $system/sns/deep/smod-1.2.tm "package provide sns::deep::smod 1.2\n"
+        set environment [newEnvironment]
+        lassign [manager add $environment sns::deep::smod --path $system] status out err
+        set again [manager add $environment sns::deep::smod --path $system]
+        set records [receipts $environment]
+        list $status $err [ids $environment] [dict get $records sns::deep::smod@1.2 target] \
+            [inEnv $environment {puts [package require sns::deep::smod]}] \
+            [lindex $again 0] [regexp -all Installed [lindex $again 1]]
+    } -result {0 {} sns::deep::smod@1.2 modules/sns/deep/smod-1.2.tm 1.2 0 0}
+
+    test add-duplicate-version {the copy Tcl itself loads is the one copied} -body {
+        variable host
+        set system [fresh]
+        foreach dir {a b c} {
+            putBytes $system/$dir/pkgIndex.tcl \
+                "package ifneeded stwin 1.0 \[list apply {{} {package provide stwin 1.0; set ::stwin_from $dir}}\]\n"
+        }
+        set probe [putBytes [file join [fresh] probe.tcl] \
+            "set auto_path \[linsert \$auto_path 0 [list $system]\]; package require stwin; puts \$::stwin_from"]
+        set expected [exec $host $probe]
+        set environment [newEnvironment]
+        lassign [manager add $environment stwin --path $system] status
+        list $status [expr {[ids $environment] eq $expected}] \
+            [inEnv $environment {package require stwin; puts $::stwin_from}]
+    } -match glob -result {0 1 ?}
+
+    test add-module {a system .tm module is added as a module} -body {
+        set system [fresh]
+        putBytes $system/sysmod-1.1.tm "package provide sysmod 1.1\n"
+        set environment [newEnvironment]
+        lassign [manager add $environment sysmod --path $system] status
+        list $status [ids $environment] [inEnv $environment {puts [package require sysmod]}]
+    } -result {0 sysmod@1.1 1.1}
+
+    test add-core {a package of Tcl's own adds nothing} -body {
+        set environment [newEnvironment]
+        lassign [manager add $environment msgcat] status out
+        list $status [ids $environment] [string match "*Added msgcat*" $out]
+    } -result {0 {} 1}
+
+    test add-noisy {a package printing as it loads doesn't disturb discovery or the load check} -body {
+        set system [fresh]
+        sysPackage $system snoisy1.0 snoisy 1.0 {} {puts "banner \{ unbalanced"; puts stderr warning}
+        set environment [newEnvironment]
+        lassign [manager add $environment snoisy --path $system] status out err
+        list $status [ids $environment] [string match "*Added snoisy 1.0*" $out]
+    } -result {0 snoisy1.0 1}
+
+    test add-symlinks {links in a system package are copied as the files they point to} -constraints unix -body {
+        set system [fresh]
+        sysPackage $system slink1.0 slink 1.0
+        putBytes $system/slink1.0/libslink1.0.so "binary\n"
+        file link -symbolic $system/slink1.0/libslink.so libslink1.0.so
+        file link -symbolic $system/slink1.0/twice.so libslink.so
+        set environment [newEnvironment]
+        lassign [manager add $environment slink --path $system] status
+        set lib [file join $environment lib slink1.0]
+        list $status [file type $lib/libslink.so] [getBytes $lib/libslink.so] [getBytes $lib/twice.so] \
+            [file type $system/slink1.0/libslink.so] [lindex [manager doctor $environment] 0]
+    } -result [list 0 file "binary\n" "binary\n" link 0]
+
+    test add-symlink-directory {a link to a directory in a system package is refused} -constraints unix -body {
+        set system [fresh]
+        sysPackage $system sdl1.0 sdl 1.0
+        file link -symbolic $system/sdl1.0/elsewhere [fresh]
+        set environment [newEnvironment]
+        lassign [manager add $environment sdl --path $system] status - err
+        list $status [string match "*other than a regular file*" $err] [ids $environment] [libContents $environment]
+    } -result {1 1 {} {}}
+
+    test install-deps-optional {a requirement found by reading that can't be added is reported, the package kept} -constraints unix -body {
+        set system [fresh]
+        sysPackage $system sopt1.0 sopt 1.0
+        file link -symbolic $system/sopt1.0/bad [fresh]
+        set source [fresh]
+        sysPackage $source suser1.0 suser 1.0 {} {proc suser::later {} {package require sopt; package require no_such_pkg_x}}
+        putBytes $source/suser1.0/suser.tcl "namespace eval suser {}\n[getBytes $source/suser1.0/suser.tcl]"
+        set environment [newEnvironment]
+        lassign [manager install $environment $source/suser1.0 --deps --check --path $system] status out
+        list $status [ids $environment] [string match "*Could not add sopt*" $out] \
+            [string match "*no_such_pkg_x, which isn't installed*" $out]
+    } -result {0 suser1.0 1 1}
+
+    test available-list {available lists --path packages, filtered by pattern} -body {
+        set system [fresh]
+        sysPackage $system sbase1.0 sbase 1.0
+        sysPackage $system sver2.0 sver 2.0
+        set environment [newEnvironment]
+        lassign [manager available $environment s?er --path $system] status out
+        list $status [string trim $out]
+    } -match glob -result "0 {sver\t2.0\t*/sver2.0}"
+
+    test install-directory-deps {install --deps adds what a directory package requires} -body {
+        set system [fresh]
+        sysPackage $system sbase1.0 sbase 1.0
+        set source [fresh]
+        sysPackage $source sdir1.0 sdir 1.0 sbase
+        set environment [newEnvironment]
+        lassign [manager install $environment $source/sdir1.0 --deps --check --path $system] status out
+        set plain [newEnvironment]
+        lassign [manager install $plain $source/sdir1.0] status2
+        list $status [ids $environment] [inEnv $environment {puts [package require sdir]}] $status2 [ids $plain]
+    } -result {0 {sbase1.0 sdir1.0} 1.0 0 sdir1.0}
+
+    test install-options {conflicting or misplaced options are refused} -body {
+        set environment [newEnvironment]
+        set source [fresh]
+        sysPackage $source sopt1.0 sopt 1.0
+        lassign [manager install $environment $source/sopt1.0 --deps --no-deps] s1 - e1
+        lassign [manager install $environment $source/sopt1.0 --sha256 [string repeat 0 64]] s2 - e2
+        lassign [manager install $environment $source/sopt1.0 --bogus] s3 - e3
+        list $s1 $s2 [string match *archives* $e2] $s3 [string match "*unknown option*" $e3] [ids $environment]
+    } -result {1 1 1 1 1 {}}
+
+    # --- URLs --------------------------------------------------------------
+
+    # A small HTTP server in a child process (the manager runs while this
+    # process waits in exec), serving files from a directory and one redirect.
+    proc startServer {directory} {
+        variable host
+        variable work
+        set script [putBytes [file join $work server.tcl] {
+            set root [lindex $argv 0]
+            proc serve {ch args} {
+                fconfigure $ch -translation binary
+                set line [gets $ch]
+                # (Binary mode: the blank line is a lone \r.)
+                while {[gets $ch header] >= 0 && [string trim $header] ne ""} {}
+                set path [lindex $line 1]
+                if {$path eq "/moved.zip"} {
+                    puts -nonewline $ch "HTTP/1.0 302 Found\r\nLocation: /sdemo1.0.zip\r\nContent-Length: 0\r\n\r\n"
+                } elseif {$path eq "/dir/relative.zip"} {
+                    puts -nonewline $ch "HTTP/1.0 302 Found\r\nLocation: ../sdemo1.0.zip\r\nContent-Length: 0\r\n\r\n"
+                } elseif {$path eq "/to-https.zip"} {
+                    puts -nonewline $ch "HTTP/1.0 301 Moved\r\nLocation: https://127.0.0.1:1/sdemo1.0.zip\r\nContent-Length: 0\r\n\r\n"
+                } elseif {$path eq "/slow.bin"} {
+                    # 8000 bytes over about 1.2 s, never idle for more than 150 ms.
+                    puts -nonewline $ch "HTTP/1.0 200 OK\r\nContent-Length: 8000\r\n\r\n"
+                    catch {
+                        for {set i 0} {$i < 8} {incr i} {
+                            puts -nonewline $ch [string repeat x 1000]
+                            flush $ch
+                            after 150
+                        }
+                    }
+                } elseif {$path eq "/endless.bin"} {
+                    # No Content-Length: data until the client stops reading.
+                    puts -nonewline $ch "HTTP/1.0 200 OK\r\n\r\n"
+                    catch {
+                        for {set i 0} {$i < 4096} {incr i} {
+                            puts -nonewline $ch [string repeat x 65536]
+                            flush $ch
+                        }
+                    }
+                } elseif {[file isfile [file join $::root [string trimleft $path /]]]} {
+                    set f [open [file join $::root [string trimleft $path /]] rb]
+                    set data [read $f]
+                    close $f
+                    puts -nonewline $ch "HTTP/1.0 200 OK\r\nContent-Length: [string length $data]\r\n\r\n$data"
+                } else {
+                    puts -nonewline $ch "HTTP/1.0 404 Not Found\r\nContent-Length: 0\r\n\r\n"
+                }
+                catch {close $ch}
+            }
+            set server [socket -server serve -myaddr 127.0.0.1 0]
+            puts [lindex [fconfigure $server -sockname] 2]
+            flush stdout
+            vwait forever
+        }]
+        set ch [open |[list $host $script $directory] r]
+        set port [gets $ch]
+        list $ch $port
+    }
+    proc stopServer {server} {
+        lassign $server ch
+        catch {exec kill [pid $ch]}
+        catch {close $ch}
+    }
+
+    test install-url {URLs: --sha256 required and checked, redirects followed, 404 reported} -body {
+        set dir [fresh]
+        set archive [putBytes $dir/sdemo1.0.zip [zipOf [demoFiles sdemo1.0]]]
+        set sha [::tclvenv::fileSha256 $archive]
+        set server [startServer $dir]
+        try {
+            set base http://127.0.0.1:[lindex $server 1]
+            set environment [newEnvironment]
+            lassign [manager install $environment $base/sdemo1.0.zip] s1 - e1
+            lassign [manager install $environment $base/sdemo1.0.zip --sha256 [string repeat 1 64]] s2 - e2
+            lassign [manager install $environment $base/missing.zip --sha256 $sha] s3 - e3
+            set r1 [list $s1 [string match *--sha256* $e1] $s2 [string match *mismatch* $e2] \
+                $s3 [string match *404* $e3] [ids $environment]]
+            lassign [manager install $environment $base/moved.zip --sha256 $sha] s4
+            set origin [dict get [receipts $environment] sdemo1.0 origin]
+            list {*}$r1 $s4 [ids $environment] [dict get $origin kind] [dict get $origin url] \
+                [inEnv $environment {puts [package require sdemo]}]
+        } finally { stopServer $server }
+    } -match glob -result {1 1 1 1 1 1 {} 0 sdemo1.0 url http://127.0.0.1:*/moved.zip 1.0}
+
+    test url-resolve {redirect locations resolve against the URL} -body {
+        lmap location {https://other/x //other/y /root/z rel ../up ../../../top ./a/./b/.. /x/../y?q=a/../b ?q=1} {
+            ::tclvenv::resolveUrl http://host:8/dir/file.zip?a=b $location
+        }
+    } -result {https://other/x http://other/y http://host:8/root/z http://host:8/dir/rel http://host:8/up http://host:8/top http://host:8/dir/a/ http://host:8/y?q=a/../b http://host:8/dir/file.zip?q=1}
+
+    test install-url-relative-redirect {a relative redirect is followed} -body {
+        set dir [fresh]
+        set archive [putBytes $dir/sdemo1.0.zip [zipOf [demoFiles sdemo1.0]]]
+        set server [startServer $dir]
+        try {
+            set environment [newEnvironment]
+            lassign [manager install $environment http://127.0.0.1:[lindex $server 1]/dir/relative.zip \
+                --sha256 [::tclvenv::fileSha256 $archive]] status - err
+            list $status $err [ids $environment]
+        } finally { stopServer $server }
+    } -result {0 {} sdemo1.0}
+
+    test download-https-without-tls {a redirect to https without tls goes to curl or wget} -setup {
+        rename ::tclvenv::haveTls ::tclvenv::realHaveTls
+        rename ::tclvenv::downloadExternal ::tclvenv::realDownloadExternal
+        proc ::tclvenv::haveTls {} { return 0 }
+        proc ::tclvenv::downloadExternal {url file limit} {
+            set ::sources::external $url
+            set ch [open $file w]
+            close $ch
+        }
+    } -body {
+        variable external ""
+        set dir [fresh]
+        set server [startServer $dir]
+        try {
+            ::tclvenv::download http://127.0.0.1:[lindex $server 1]/to-https.zip [file join $dir out]
+        } finally { stopServer $server }
+        set external
+    } -cleanup {
+        rename ::tclvenv::haveTls {}
+        rename ::tclvenv::downloadExternal {}
+        rename ::tclvenv::realHaveTls ::tclvenv::haveTls
+        rename ::tclvenv::realDownloadExternal ::tclvenv::downloadExternal
+    } -result {https://127.0.0.1:1/sdemo1.0.zip}
+
+    test install-url-limit {a download over the size limit is stopped} -body {
+        set dir [fresh]
+        set archive [putBytes $dir/big.zip [zipBytes [list [list big [string repeat x 300000]]] 0]]
+        set server [startServer $dir]
+        try {
+            set environment [newEnvironment]
+            lassign [managerWith {TCLVENV_ARCHIVE_LIMIT 100000} install $environment \
+                http://127.0.0.1:[lindex $server 1]/big.zip --sha256 [::tclvenv::fileSha256 $archive]] status - err
+            list $status [string match "*size limit*" $err] [ids $environment]
+        } finally { stopServer $server }
+    } -result {1 1 {}}
+
+    # --- Functional review fixes ------------------------------------------
+
+    test install-archive-load-exits {a load check that ends the interpreter rolls the install back} -body {
+        set dir [fresh]
+        set environment [newEnvironment]
+        set archive [putBytes $dir/sexit1.0.zip [zipOf {
+            sexit1.0/pkgIndex.tcl "package ifneeded sexit 1.0 {exit 3}\n"
+        }]]
+        lassign [manager install $environment $archive] status - err
+        list $status [string match "*loading sexit in the environment failed, so nothing was installed*" $err] \
+            [ids $environment] [libContents $environment]
+    } -result {1 1 {} {}}
+
+    test install-archive-load-hangs {a load check past the deadline rolls the install back} -body {
+        set dir [fresh]
+        set environment [newEnvironment]
+        set archive [putBytes $dir/shang1.0.zip [zipOf {
+            shang1.0/pkgIndex.tcl "package ifneeded shang 1.0 {after 20000}\n"
+        }]]
+        lassign [managerWith {TCLVENV_PROBE_TIMEOUT 2000} install $environment $archive] status - err
+        list $status [string match "*did not finish*" $err] [ids $environment]
+    } -result {1 1 {}}
+
+    test add-load-exits {add: a load check that ends the interpreter removes what was added} -body {
+        set system [fresh]
+        sysPackage $system sbase1.0 sbase 1.0
+        sysPackage $system sexits1.0 sexits 1.0 sbase \
+            {if {[info exists ::env(TCLVENV)]} { exit 3 }}
+        set environment [newEnvironment]
+        lassign [manager add $environment sexits --path $system] status out err
+        list $status [string match "*loading sexits in the environment failed, so nothing was added*" $err] \
+            [ids $environment] [libContents $environment]
+    } -result {1 1 {} {}}
+
+    test install-deps-partial-rollback {requirements added before a failure are rolled back with the package} -setup {
+        rename ::tclvenv::providedByEnvironment ::tclvenv::realProvidedByEnvironment
+        # Fails once the requirement has been added: the check after it.
+        proc ::tclvenv::providedByEnvironment {root names skipIds} {
+            if {[dict exists [::tclvenv::installed $root] sdepx1.0]} { error "simulated failure" }
+            ::tclvenv::realProvidedByEnvironment $root $names $skipIds
+        }
+    } -body {
+        set system [fresh]
+        sysPackage $system sdepx1.0 sdepx 1.0
+        set source [fresh]
+        sysPackage $source suserx1.0 suserx 1.0 sdepx
+        set environment [newEnvironment]
+        set id [::tclvenv::installTree $environment $source/suserx1.0]
+        set failed [catch {::tclvenv::finishInstall $environment [list $id] \
+            [dict create deps 1 check 0 paths [list $system]]} message]
+        list $failed $message [lsort [dict keys [::tclvenv::installed $environment]]] [libContents $environment]
+    } -cleanup {
+        rename ::tclvenv::providedByEnvironment {}
+        rename ::tclvenv::realProvidedByEnvironment ::tclvenv::providedByEnvironment
+    } -result {1 {simulated failure} {} {}}
+
+    test data-file-modes {environment data files follow the umask; a replaced file keeps its mode} -constraints unix -body {
+        # The mode open gives a new file under this process's umask.
+        set probe [file join [fresh] probe]
+        close [open $probe {WRONLY CREAT EXCL}]
+        set expected [file attributes $probe -permissions]
+        set environment [newEnvironment]
+        set cfg [file join $environment tclvenv.cfg]
+        set data [file join $environment metadata installed.tcldata]
+        set modes [list [file attributes $cfg -permissions] [file attributes $data -permissions] \
+            [file attributes [file join $environment metadata core-files.tcldata] -permissions]]
+        file attributes $data -permissions 0640
+        set dir [fresh]
+        lassign [manager install $environment [putBytes $dir/smode-1.0.tm "package provide smode 1.0\n"]] status
+        list [expr {$modes eq [list $expected $expected $expected]}] $status \
+            [format %o [expr {[file attributes $data -permissions] & 0o7777}]] [ids $environment]
+    } -result {1 0 640 smode@1.0}
+
+    test sha256-external {large files hash the same with sha256sum/shasum, in Tcl, and after a failing command} -constraints unix -setup {
+        variable savedCommand [::tclvenv::sha256Command]
+        variable savedMinimum $::tclvenv::externalHashMinimum
+        set ::tclvenv::externalHashMinimum 1000
+    } -body {
+        set path [putBytes [file join [fresh] "big file"] [string repeat "0123456789abcdef\x00\xff" 3000]]
+        set results {}
+        foreach command [list $savedCommand {} [list [auto_execok false]]] {
+            set ::tclvenv::sha256Command $command
+            lappend results [::tclvenv::fileSha256 $path] [dict get [::tclvenv::fileInfo $path] sha256]
+        }
+        list [expr {[llength $savedCommand] > 0}] [llength [lsort -unique $results]] \
+            [regexp {^[0-9a-f]{64}$} [lindex $results 0]]
+    } -cleanup {
+        set ::tclvenv::sha256Command $savedCommand
+        set ::tclvenv::externalHashMinimum $savedMinimum
+    } -result {1 1 1}
+
+    test remove-hashes-once {remove hashes the package's files once, not twice} -setup {
+        rename ::tclvenv::inventory ::tclvenv::realInventory
+        variable hashed 0
+        proc ::tclvenv::inventory {path {hash 1} {relative ""}} {
+            if {$hash && $relative eq "" && [string match */payload $path]} { incr ::sources::hashed }
+            ::tclvenv::realInventory $path $hash $relative
+        }
+    } -body {
+        set environment [newEnvironment]
+        set source [fresh]
+        sysPackage $source sonce1.0 sonce 1.0
+        set id [::tclvenv::installTree $environment $source/sonce1.0]
+        set hashed 0
+        ::tclvenv::remove $environment $id
+        list $hashed [dict keys [::tclvenv::installed $environment]] [libContents $environment]
+    } -cleanup {
+        rename ::tclvenv::inventory {}
+        rename ::tclvenv::realInventory ::tclvenv::inventory
+    } -result {1 {} {}}
+
+    test download-idle-timeout {http's timeout is idle time: a slow download that keeps sending succeeds} -setup {
+        variable savedTimes [list $::tclvenv::downloadIdle $::tclvenv::downloadLimit]
+    } -body {
+        set dir [fresh]
+        set server [startServer $dir]
+        try {
+            set url http://127.0.0.1:[lindex $server 1]/slow.bin
+            set ::tclvenv::downloadIdle 600
+            set ::tclvenv::downloadLimit 20000
+            set ok [catch {::tclvenv::download $url [file join $dir slow1]} m1]
+            set ::tclvenv::downloadLimit 500
+            set late [catch {::tclvenv::download $url [file join $dir slow2]} m2]
+        } finally { stopServer $server }
+        list $ok [file size [file join $dir slow1]] $late [regexp {took longer|timeout} $m2]
+    } -cleanup {
+        lassign $savedTimes ::tclvenv::downloadIdle ::tclvenv::downloadLimit
+    } -result {0 8000 1 1}
+
+    testConstraint devFull [expr {$::tcl_platform(platform) eq "unix" && [file writable /dev/full]}]
+
+    test download-names-file {a download that can't be written names the file, not a channel} -constraints devFull -body {
+        set dir [fresh]
+        putBytes $dir/data.bin [string repeat z 300000]
+        set server [startServer $dir]
+        try {
+            set failed [catch {::tclvenv::download http://127.0.0.1:[lindex $server 1]/data.bin /dev/full} message]
+        } finally { stopServer $server }
+        list $failed [string match -nocase "*/dev/full*no space*" $message] [regexp {"file[0-9]+"} $message]
+    } -result {1 1 0}
+
+    testConstraint wget [expr {[auto_execok wget] ne ""}]
+    testConstraint curl [expr {[auto_execok curl] ne ""}]
+
+    proc externalDownload {tool url file environment} {
+        set saved [list $::tclvenv::externalTools $::tclvenv::downloadIdle $::tclvenv::downloadLimit]
+        set ::tclvenv::externalTools [list $tool]
+        dict for {key value} $environment { set ::tclvenv::$key $value }
+        set started [clock milliseconds]
+        try {
+            set failed [catch {::tclvenv::downloadExternal $url $file [::tclvenv::archive::limit]} message]
+        } finally {
+            lassign $saved ::tclvenv::externalTools ::tclvenv::downloadIdle ::tclvenv::downloadLimit
+        }
+        list $failed $message [expr {[clock milliseconds] - $started}]
+    }
+
+    foreach tool {wget curl} {
+        test download-external-limit-$tool "$tool is stopped once the file passes the size limit" -constraints $tool -body {
+            set dir [fresh]
+            set server [startServer $dir]
+            set ::env(TCLVENV_ARCHIVE_LIMIT) 1000000
+            try {
+                lassign [externalDownload $tool http://127.0.0.1:[lindex $server 1]/endless.bin \
+                    [file join $dir endless] {}] failed message elapsed
+            } finally {
+                unset ::env(TCLVENV_ARCHIVE_LIMIT)
+                stopServer $server
+            }
+            list $failed [string match "*size limit*" $message] [expr {$elapsed < 20000}]
+        } -result {1 1 1}
+
+        test download-external-deadline-$tool "$tool is stopped at the overall deadline" -constraints $tool -body {
+            set dir [fresh]
+            set server [startServer $dir]
+            try {
+                lassign [externalDownload $tool http://127.0.0.1:[lindex $server 1]/slow.bin \
+                    [file join $dir slow] {downloadLimit 400}] failed message elapsed
+            } finally { stopServer $server }
+            list $failed [regexp {took longer|exit status} $message] [expr {$elapsed < 5000}]
+        } -result {1 1 1}
+
+        test download-external-ok-$tool "$tool downloads a slow file within the limits" -constraints $tool -body {
+            set dir [fresh]
+            set server [startServer $dir]
+            try {
+                lassign [externalDownload $tool http://127.0.0.1:[lindex $server 1]/slow.bin \
+                    [file join $dir slow] {downloadIdle 5000 downloadLimit 20000}] failed message
+            } finally { stopServer $server }
+            list $failed $message [file size [file join $dir slow]]
+        } -result {0 {} 8000}
+    }
+
+    test doctor-components {environments get the archive reader and the discovery script} -body {
+        set environment [newEnvironment]
+        file delete [file join $environment metadata discover.tcl]
+        lassign [manager doctor $environment] status out err
+        list [file exists [file join $environment metadata archive.tcl]] $status [string match *discover.tcl* $out$err]
+    } -result {1 1 1}
+
+    ::tclvenv::deleteOwned $work
+    removeDirectory $work
+    cleanupTests
+}

@@ -1,0 +1,127 @@
+package require tcltest 2
+# Regressions for the outputs fuzz group (tests/FUZZ_OUTPUTS_REPORT.md): what
+# the manager does when its output can't be written.
+namespace eval ::outputs {
+    namespace import ::tcltest::*
+    variable project [file dirname [file dirname [file normalize [info script]]]]
+    variable host [info nameofexecutable]
+    variable cli [file join $project tclvenv.tcl]
+    variable work [makeDirectory "outputs-[pid]"]
+    variable count 0
+    testConstraint devfull [expr {$::tcl_platform(platform) eq "unix" && [file writable /dev/full]}]
+    testConstraint json [expr {![catch {exec -- [info nameofexecutable] << "package require json\nexit 0\n"}]}]
+
+    proc putText {path text} {
+        file mkdir [file dirname $path]
+        set ch [open $path w]
+        try { puts -nonewline $ch $text } finally { close $ch }
+        return $path
+    }
+    proc getText {path} {
+        if {![file exists $path]} { return "" }
+        set ch [open $path r]
+        try { read $ch } finally { close $ch }
+    }
+    proc fresh {} {
+        variable work
+        variable count
+        set path [file join $work dir[incr count]]
+        file mkdir $path
+        return $path
+    }
+    # Runs the manager through sh with stdout as given ("full", or
+    # "pipe N": a reader that stops after N bytes): {status stderr}.
+    proc broken {stdout args} {
+        variable host
+        variable cli
+        variable work
+        set words [lmap word [list $host $cli {*}$args] {format '%s' [string map {' '\\''} $word]}]
+        set err [file join $work err]
+        set statusFile [file join $work status]
+        file delete -- $err $statusFile
+        switch -- [lindex $stdout 0] {
+            full { set line "{ [join $words { }] >/dev/full 2>'$err'; echo \$? >'$statusFile'; }" }
+            pipe { set line "{ [join $words { }] 2>'$err'; echo \$? >'$statusFile'; } | head -c [lindex $stdout 1] >/dev/null" }
+        }
+        exec -- sh -c $line
+        list [string trim [getText $statusFile]] [getText $err]
+    }
+    proc manager {args} {
+        variable host
+        variable cli
+        catch {exec -- $host $cli {*}$args 2>@1} out
+        return $out
+    }
+    proc newEnvironment {} {
+        set path [file join [fresh] env]
+        manager create $path
+        return $path
+    }
+    proc ids {environment} {
+        lsort [lmap line [split [string trim [manager list $environment]] \n] {lindex [split $line \t] 0}]
+    }
+    proc package {root name {body ""}} {
+        putText [file join $root $name pkgIndex.tcl] \
+            "package ifneeded $name 1.0 \[list source \[file join \$dir $name.tcl\]\]\n"
+        putText [file join $root $name $name.tcl] "${body}package provide $name 1.0\n"
+        file join $root $name
+    }
+    variable completed {tclvenv: the command completed, but its output couldn't be written (error writing "stdout": *)}
+
+    # 1. A command that changes the environment makes its change and
+    # succeeds, whatever happens to its output.
+    test change-1.create {create with stdout full} -constraints devfull -body {
+        variable completed
+        set path [file join [fresh] env]
+        lassign [broken full create $path] status err
+        list $status [string match $completed\n $err] [file isfile [file join $path tclvenv.cfg]] \
+            [string match Runtime* [manager doctor $path]]
+    } -result {0 1 1 1}
+    test change-1.install {install with stdout full} -constraints devfull -body {
+        set environment [newEnvironment]
+        lassign [broken full install $environment [package [fresh] pkga]] status
+        list $status [ids $environment]
+    } -result {0 pkga}
+    test change-1.remove {remove with stdout full} -constraints devfull -body {
+        set environment [newEnvironment]
+        manager install $environment [package [fresh] pkga]
+        lassign [broken full remove $environment pkga] status
+        list $status [ids $environment]
+    } -result {0 {}}
+    test change-1.add {add whose reader stops after 5 bytes: kept, not rolled back} -constraints {devfull json} -body {
+        set environment [newEnvironment]
+        lassign [broken {pipe 5} add $environment json] status err
+        list $status [expr {"json" in [ids $environment]}] [string match "*could not roll back*" $err]
+    } -result {0 1 0}
+    test change-1.deps {install --deps with stdout full adds the requirement too} -constraints {devfull json} -body {
+        set environment [newEnvironment]
+        set source [package [fresh] usesjson "package require json\n"]
+        lassign [broken full install $environment $source --deps --check] status
+        set ids [ids $environment]
+        list $status [expr {"json" in $ids}] [expr {"usesjson" in $ids}]
+    } -result {0 1 1}
+
+    # 2. A read-only command whose output can't be written fails, with one
+    # line and no stack trace; quietly when the reader just stopped.
+    test read-2.full {info with stdout full} -constraints devfull -body {
+        lassign [broken full info [newEnvironment]] status err
+        list $status [string match {tclvenv: couldn't write the output: error writing "stdout": *} $err] \
+            [llength [split [string trim $err] \n]]
+    } -result {1 1 1}
+    test read-2.pipe {doctor | head -1: no message, no trace} -constraints devfull -body {
+        broken {pipe 10} doctor [newEnvironment]
+    } -result {1 {}}
+    test read-2.list {list | head -c 0 of a non-empty list: quiet failure} -constraints devfull -body {
+        set environment [newEnvironment]
+        manager install $environment [package [fresh] pkga]
+        broken {pipe 0} list $environment
+    } -result {1 {}}
+    test read-2.doctor-output {doctor still prints its paths when all is well} -body {
+        set environment [newEnvironment]
+        set lines [split [string trim [manager doctor $environment]] \n]
+        list [llength $lines] [string match "Package paths: *" [lindex $lines 1]] [string match "Module paths: *" [lindex $lines 2]]
+    } -result {3 1 1}
+
+    cleanupTests
+}
+namespace delete ::outputs

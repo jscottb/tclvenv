@@ -1,0 +1,182 @@
+package require tcltest 2
+# Regressions for the findings of the real-package fuzz group
+# (tests/FUZZ_REALPACKAGES_REPORT.md), one or more per finding.
+namespace eval ::discovery {
+    namespace import ::tcltest::*
+    variable project [file dirname [file dirname [file normalize [info script]]]]
+    variable host [info nameofexecutable]
+    variable cli [file join $project tclvenv.tcl]
+    variable work [makeDirectory "discovery-[pid]"]
+    variable count 0
+
+    proc putText {path text} {
+        file mkdir [file dirname $path]
+        set ch [open $path w]
+        try {
+            fconfigure $ch -encoding utf-8 -translation lf
+            puts -nonewline $ch $text
+        } finally { close $ch }
+        return $path
+    }
+    proc getText {path} {
+        set ch [open $path r]
+        try { fconfigure $ch -encoding utf-8; read $ch } finally { close $ch }
+    }
+    # Runs a command (no exec grammar in the arguments): {status stdout stderr}.
+    proc run {input args} {
+        variable work
+        set in [putText [file join $work stdin] $input]
+        set out [file join $work out]
+        set err [file join $work err]
+        set status 0
+        if {[catch {exec -- {*}$args < $in > $out 2> $err} message options]} {
+            set code [dict get $options -errorcode]
+            set status [expr {[lindex $code 0] eq "CHILDSTATUS" ? [lindex $code 2] : $message}]
+        }
+        list $status [getText $out] [getText $err]
+    }
+    proc manager {args} {
+        variable host
+        variable cli
+        run "" $host $cli {*}$args
+    }
+    proc fresh {} {
+        variable work
+        variable count
+        set path [file join $work dir[incr count]]
+        file mkdir $path
+        return $path
+    }
+    proc newEnvironment {} {
+        set path [file join [fresh] env]
+        lassign [manager create $path] status out err
+        if {$status != 0} { error "create failed: $err" }
+        return $path
+    }
+    proc load {environment script} {
+        run $script [file join $environment bin tclsh] --stdin
+    }
+
+    # 1. A package an index provides itself, not through package ifneeded
+    # (as Tcllib's try/pkgIndex.tcl provides file::home on Tcl 9).
+    proc providedTree {} {
+        set root [fresh]
+        putText [file join $root compat pkgIndex.tcl] {
+            package ifneeded compatold 1.0 [list package provide compatold 1.0]
+            if {[package vsatisfies [package provide Tcl] 8.6-]} {
+                package provide compathome 1
+                return
+            }
+            package ifneeded compathome 1 [list source [file join $dir home.tcl]]
+        }
+        putText [file join $root compat home.tcl] "package provide compathome 1\n"
+        putText [file join $root user pkgIndex.tcl] \
+            {package ifneeded userpkg 1.0 [list source [file join $dir user.tcl]]}
+        putText [file join $root user user.tcl] "package require compathome\npackage provide userpkg 1.0\n"
+        return $root
+    }
+    test provided-1.add {add copies the directory whose index provides a requirement} -body {
+        set root [providedTree]
+        set environment [newEnvironment]
+        lassign [manager add $environment userpkg --path $root] status out err
+        list $status $err [file isdirectory [file join $environment lib compat]] \
+            [lindex [load $environment "puts \[package require userpkg\]\n"] 1]
+    } -result [list 0 {} 1 "1.0\n"]
+    test provided-1.direct {add of the provided package itself} -body {
+        set root [providedTree]
+        set environment [newEnvironment]
+        lassign [manager add $environment compathome --path $root] status out err
+        list $status $err [lindex [load $environment "puts \[package require compathome\]\n"] 1]
+    } -result [list 0 {} "1\n"]
+    test provided-1.available {available lists the provided package with its directory} -body {
+        set root [providedTree]
+        set environment [newEnvironment]
+        lassign [manager available $environment compathome --path $root] status out err
+        lassign [split [string trim $out] \t] name version path
+        list $status $name $version [expr {$path eq [file join [file normalize $root] compat]}]
+    } -result {0 compathome 1 1}
+    test provided-1.remove {the copied provider is removed with the package} -body {
+        set root [providedTree]
+        set environment [newEnvironment]
+        manager add $environment userpkg --path $root
+        lassign [manager list $environment] - out
+        foreach line [lreverse [split [string trim $out] \n]] {
+            manager remove $environment [lindex [split $line \t] 0]
+        }
+        list [glob -nocomplain -tails -directory [file join $environment lib] *] [lindex [manager doctor $environment] 0]
+    } -result {{} 0}
+
+    # 2. A package that loads Tk: the helper interpreters (discover and the
+    # load check) must neither show Tk's main window nor stay in its main
+    # loop after their result is written.
+    variable host
+    testConstraint tkDisplay [expr {[info exists ::env(DISPLAY)] && $::env(DISPLAY) ne "" &&
+        [lindex [run "if {\[catch {package require Tk}\]} {exit 1}\nexit 0\n" $host] 0] == 0}]
+    proc tkTree {} {
+        set root [fresh]
+        putText [file join $root tkuser pkgIndex.tcl] \
+            {package ifneeded tkuser 1.0 [list source [file join $dir tkuser.tcl]]}
+        putText [file join $root tkuser tkuser.tcl] "package require Tk\npackage provide tkuser 1.0\n"
+        return $root
+    }
+    proc quickly {args} {
+        # The old behaviour waited for the probe timeout: make that short.
+        set ::env(TCLVENV_PROBE_TIMEOUT) 5000
+        try {
+            set start [clock milliseconds]
+            set result [manager {*}$args]
+            list {*}$result [expr {[clock milliseconds] - $start < 5000}]
+        } finally { unset ::env(TCLVENV_PROBE_TIMEOUT) }
+    }
+    proc windows {} {
+        # Tk names its main window after the script: discover.tcl, script.tcl.
+        if {[auto_execok xwininfo] eq "" || [catch {exec -- xwininfo -root -tree} tree]} { return {} }
+        regexp -all -inline {"(?:discover|script)\.tcl"} $tree
+    }
+    test tk-2.add {add of a package that loads Tk finishes without waiting} -constraints tkDisplay -body {
+        set root [tkTree]
+        set environment [newEnvironment]
+        lassign [quickly add $environment tkuser --path $root] status out err fast
+        list $status $err $fast [windows]
+    } -result [list 0 {} 1 {}]
+    test tk-2.install {the load check of an installed directory that loads Tk} -constraints tkDisplay -body {
+        set root [tkTree]
+        set environment [newEnvironment]
+        manager add $environment Tk
+        lassign [quickly install $environment [file join $root tkuser] --check] status out err fast
+        list $status $err $fast [windows]
+    } -result [list 0 {} 1 {}]
+
+    # 3. A script library an extension finds with tcl_findLibrary outside
+    # its index's directory (Tk 8.6 on Debian: /usr/share/tcltk/tk8.6).
+    proc libraryTree {} {
+        set root [fresh]
+        putText [file join $root pkgs mylib1.0 pkgIndex.tcl] {
+            package ifneeded mylib 1.0 [list apply {{} {
+                tcl_findLibrary mylib 1.0 1.0 mylib.tcl MYLIB_LIBRARY mylib_library
+                package provide mylib 1.0
+            }}]
+        }
+        putText [file join $root share mylib1.0 mylib.tcl] "set ::mylib_loaded \[info script\]\n"
+        putText [file join $root share mylib1.0 sub data.txt] "library data\n"
+        return $root
+    }
+    test library-3.add {the library is copied beside the index, and found there} -body {
+        set root [libraryTree]
+        set environment [newEnvironment]
+        lassign [manager add $environment mylib --path [file join $root pkgs] --path [file join $root share]] status out err
+        set loaded [load $environment "package require mylib\nputs \[list \$mylib_library \$mylib_loaded\]\n"]
+        set inside [file join $environment lib mylib1.0]
+        list $status $err [lindex $loaded 1] [file isfile [file join $inside sub data.txt]]
+    } -match glob -result [list 0 {} "*/lib/mylib1.0 */lib/mylib1.0/mylib.tcl\n" 1]
+    test library-3.remove {removal takes the library with it} -body {
+        set root [libraryTree]
+        set environment [newEnvironment]
+        manager add $environment mylib --path [file join $root pkgs] --path [file join $root share]
+        lassign [manager remove $environment mylib1.0] status
+        list $status [glob -nocomplain -tails -directory [file join $environment lib] *] [lindex [manager doctor $environment] 0]
+    } -result {0 {} 0}
+
+    cleanupTests
+}
+namespace delete ::discovery

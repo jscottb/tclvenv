@@ -1,0 +1,380 @@
+package require tcltest 2
+# Regressions for the findings of the hostile-input fuzz groups
+# (tests/FUZZ_HOSTILE_REPORT.md), one or more per finding.
+namespace eval ::hostile {
+    namespace import ::tcltest::*
+    variable project [file dirname [file dirname [file normalize [info script]]]]
+    source [file join $project lib manager.tcl]
+    variable host [info nameofexecutable]
+    variable cli [file join $project tclvenv.tcl]
+    variable work [makeDirectory "hostile-[pid]"]
+    variable count 0
+    testConstraint unix [expr {$::tcl_platform(platform) eq "unix"}]
+
+    proc putBytes {path data} {
+        set ch [open $path wb]
+        try { puts -nonewline $ch $data } finally { close $ch }
+        return $path
+    }
+    proc getBytes {path} {
+        set ch [open $path rb]
+        try { read $ch } finally { close $ch }
+    }
+    # Runs the manager: {status stdout stderr}, stdin from input (bytes).
+    proc manager {args} {
+        variable host
+        variable cli
+        variable work
+        set in [putBytes [file join $work stdin] ""]
+        runCommand [list $host $cli {*}$args] $in
+    }
+    proc runCommand {command input {environment {}}} {
+        variable work
+        set out [file join $work out]
+        set err [file join $work err]
+        set saved {}
+        dict for {key value} $environment {
+            if {[info exists ::env($key)]} { dict set saved $key $::env($key) }
+            set ::env($key) $value
+        }
+        try {
+            set status 0
+            if {[catch {exec -- {*}$command < $input > $out 2> $err} message options]} {
+                set code [dict get $options -errorcode]
+                set status [expr {[lindex $code 0] eq "CHILDSTATUS" ? [lindex $code 2] : $message}]
+            }
+        } finally {
+            dict for {key value} $environment {
+                unset -nocomplain ::env($key)
+                if {[dict exists $saved $key]} { set ::env($key) [dict get $saved $key] }
+            }
+        }
+        list $status [getBytes $out] [getBytes $err]
+    }
+    proc newEnvironment {} {
+        variable work
+        variable count
+        set path [file join $work env[incr count]]
+        lassign [manager create $path] status out err
+        if {$status != 0} { error "create failed: $err" }
+        return $path
+    }
+    proc package {name {files {data original}}} {
+        variable work
+        variable count
+        # String paths: a name like ~x stays a literal component on Tcl 8.6.
+        set path "$work/src[incr count]/$name"
+        file mkdir $path
+        putBytes "$path/pkgIndex.tcl" "package ifneeded hostile_probe 1.0 \[list source \[file join \$dir probe.tcl\]\]\n"
+        putBytes "$path/probe.tcl" "package provide hostile_probe 1.0\n"
+        foreach {relative data} $files {
+            file mkdir [file dirname "$path/$relative"]
+            putBytes "$path/$relative" $data
+        }
+        return $path
+    }
+    proc fakeRuntime {name body} {
+        variable work
+        set path [file join $work $name]
+        putBytes $path "#!/bin/sh\n$body\n"
+        file attributes $path -permissions 0755
+        return $path
+    }
+    # Runs stdin bytes through native Tcl and an environment's launcher.
+    proc stdinBoth {environment bytes} {
+        variable host
+        variable work
+        set in [putBytes [file join $work stdin-program] $bytes]
+        list [runCommand [list $host] $in] [runCommand [list [file join $environment bin tclsh]] $in]
+    }
+    # A same-size change keeping CRC-32: change the first bytes, then fix the
+    # last four (CRC-32 is affine, so that is a 32x32 GF(2) solve).
+    proc forgeCrc {original replacement} {
+        set changed [string replace $original 0 [expr {[string length $replacement] - 1}] $replacement]
+        set at [expr {[string length $changed] - 4}]
+        set base [zlib crc32 $changed]
+        set target [expr {[zlib crc32 $original] ^ $base}]
+        set pivots {}
+        for {set j 0} {$j < 32} {incr j} {
+            set v [expr {[zlib crc32 [xorWord $changed $at [expr {1 << $j}]]] ^ $base}]
+            set m [expr {1 << $j}]
+            foreach {pv pm} $pivots {
+                if {$v & ($pv & -$pv)} { set v [expr {$v ^ $pv}]; set m [expr {$m ^ $pm}] }
+            }
+            if {$v} {
+                set low [expr {$v & -$v}]
+                set reduced {}
+                foreach {pv pm} $pivots {
+                    if {$pv & $low} { set pv [expr {$pv ^ $v}]; set pm [expr {$pm ^ $m}] }
+                    lappend reduced $pv $pm
+                }
+                set pivots [concat $reduced [list $v $m]]
+            }
+        }
+        set fix 0
+        foreach {pv pm} $pivots {
+            if {$target & ($pv & -$pv)} { set target [expr {$target ^ $pv}]; set fix [expr {$fix ^ $pm}] }
+        }
+        if {$target} { error "no CRC-preserving fix-up" }
+        xorWord $changed $at $fix
+    }
+    proc xorWord {data at value} {
+        binary scan $data cu* bytes
+        for {set i 0} {$i < 4} {incr i} {
+            set p [expr {$at + $i}]
+            lset bytes $p [expr {[lindex $bytes $p] ^ (($value >> (8 * $i)) & 0xff)}]
+        }
+        binary format cu* $bytes
+    }
+
+    # --- 1, 2: the interpreter probe --------------------------------------
+
+    test probe-1.1 {creation stops an interpreter that never finishes} -constraints unix -body {
+        set fake [fakeRuntime hang-tcl {exec sleep 30}]
+        set destination [file join $work never-created]
+        set start [clock milliseconds]
+        set ::env(TCLVENV_PROBE_TIMEOUT) 500
+        try {
+            lassign [manager create $destination --tcl $fake] status out err
+        } finally { unset ::env(TCLVENV_PROBE_TIMEOUT) }
+        list $status [expr {[clock milliseconds] - $start < 10000}] \
+            [string match "tclvenv: Tcl runtime did not finish within 0.5 s*" $err] \
+            [file exists $destination] [file exists $destination.tclvenv-create.lock] \
+            [llength [glob -nocomplain -directory $work .tclvenv-create-*]]
+    } -result {1 1 1 0 0 0}
+
+    test probe-1.2 {doctor stops an interpreter that never finishes} -constraints unix -body {
+        set environment [newEnvironment]
+        set fake [fakeRuntime hang-doctor {exec sleep 30}]
+        set cfg [::tclvenv::readData [file join $environment tclvenv.cfg]]
+        dict set cfg executable $fake
+        file delete [file join $environment tclvenv.cfg]
+        ::tclvenv::writeData [file join $environment tclvenv.cfg] $cfg
+        set ::env(TCLVENV_PROBE_TIMEOUT) 500
+        try {
+            lassign [manager doctor $environment] status out err
+        } finally { unset ::env(TCLVENV_PROBE_TIMEOUT) }
+        list $status [string match "*did not finish within*" $err]
+    } -result {1 1}
+
+    test probe-1.3 {an interpreter that closes its output and keeps running doesn't hang creation} -constraints unix -body {
+        set fake [fakeRuntime closer-tcl "exec >&-\nexec sleep 3600.75"]
+        set ::env(TCLVENV_PROBE_TIMEOUT) 5000
+        set start [clock milliseconds]
+        try {
+            lassign [manager create [file join $work closer-env] --tcl $fake] status out err
+        } finally { unset ::env(TCLVENV_PROBE_TIMEOUT) }
+        list $status [expr {[clock milliseconds] - $start < 4000}] \
+            [string match "tclvenv: Tcl runtime did not report a valid identity:*" $err] \
+            [catch {exec pgrep -f {^sleep 3600.75$}}]
+    } -result {1 1 1 1}
+
+    test probe-1.4 {a stopped wrapper script takes its interpreter with it} -constraints unix -body {
+        # No exec: the hanging process is the wrapper's child.
+        set fake [fakeRuntime wrapper-hang-tcl "sleep 3600.5\necho never"]
+        set ::env(TCLVENV_PROBE_TIMEOUT) 500
+        try {
+            lassign [manager create [file join $work wrapper-env] --tcl $fake] status out err
+        } finally { unset ::env(TCLVENV_PROBE_TIMEOUT) }
+        list $status [string match "*did not finish within*" $err] [catch {exec pgrep -f {^sleep 3600.5$}}]
+    } -result {1 1 1}
+
+    test probe-2.1 {a working interpreter that warns on stderr is accepted} -constraints unix -body {
+        set fake [fakeRuntime noisy-tcl "echo 'warning from the runtime' >&2\nexec [list $host] \"\$@\""]
+        set destination [file join $work noisy-env]
+        lassign [manager create $destination --tcl $fake] status out err
+        list $status [file isfile [file join $destination tclvenv.cfg]]
+    } -result {0 1}
+
+    test probe-2.2 {a failing interpreter's error is short and quotes none of its output} -constraints unix -body {
+        set fake [fakeRuntime failing-tcl "head -c 300000 /dev/zero | tr '\\0' x\necho 'first line of the failure' >&2\nhead -c 100000 /dev/zero >&2\nexit 3"]
+        lassign [manager create [file join $work failing-env] --tcl $fake] status out err
+        list $status [expr {[string length $err] < 1000}] [expr {[string first xxxx $err] < 0}] \
+            [string match "tclvenv: Tcl runtime did not report a valid identity: *: first line of the failure" [string trim $err]]
+    } -result {1 1 1 1}
+
+    test probe-2.3 {output that isn't an identity is reported without quoting it} -constraints unix -body {
+        set fake [fakeRuntime garbage-tcl "head -c 200000 /dev/zero | tr '\\0' '\{'"]
+        lassign [manager create [file join $work garbage-env] --tcl $fake] status out err
+        list $status [expr {[string length $err] < 1000}] [string match "tclvenv: Tcl runtime did not report a valid identity:*" $err]
+    } -result {1 1 1}
+
+    # --- 3, 4, 5: stdin as native Tcl reads it ----------------------------
+
+    set stdinCases {
+        invalid-utf8 "puts a\nputs \xff\xfe\nputs b\n"
+        info-script "puts \[info script\]\n"
+        unfinished-at-eof "puts before\nset x \{\n"
+        unfinished-no-newline "puts before\nset x \{"
+    }
+    foreach {name bytes} $stdinCases {
+        test stdin-3.$name {stdin programs behave as in native Tcl} -setup {
+            set environment [newEnvironment]
+        } -body {
+            lassign [stdinBoth $environment $bytes] native isolated
+            expr {$native eq $isolated ? "same" : [list native $native environment $isolated]}
+        } -result same
+    }
+
+    # --- 6, 7: package names --------------------------------------------------
+
+    test names-6.1 {a package directory named with a leading dot is rejected} -setup {
+        set environment [newEnvironment]
+        set source [package .hidden]
+    } -body {
+        lassign [manager install $environment $source] status out err
+        list $status [string match {*names starting with "." are never found*} $err] \
+            [dict size [::tclvenv::installed $environment]] [file exists [file join $environment lib .hidden]]
+    } -result {1 1 0 0}
+
+    test names-7.1 {a leading ~ is part of the ID, and of inner names, on every Tcl} -setup {
+        set environment [newEnvironment]
+        set source [package ~x {~y top ~d/~z inner data plain}]
+    } -body {
+        lassign [manager install $environment $source] status out err
+        set records [::tclvenv::installed $environment]
+        set listed [lindex [manager list $environment] 1]
+        lassign [manager doctor $environment] healthy
+        set keys [lsort [dict keys [dict get $records ~x files]]]
+        lassign [manager remove $environment ~x] removed
+        list $status [dict keys $records] [dict get $records ~x target] [string match "~x\t*" $listed] \
+            $healthy $keys $removed [file exists "$environment/lib/~x"]
+    } -result {0 ~x lib/~x 1 0 {{} data pkgIndex.tcl probe.tcl ~d ~d/~z ~y} 0 0}
+
+    test names-7.3 {names that look like numbers are recorded and removed as written} -setup {
+        set environment [newEnvironment]
+        set source [package numeric {007 seven 0x10 sixteen 1e3 thousand { 12} twelve 00/007 inner}]
+    } -body {
+        lassign [manager install $environment $source] installed
+        set keys [lsort [dict keys [dict get [::tclvenv::installed $environment] numeric files]]]
+        lassign [manager doctor $environment] healthy
+        lassign [manager remove $environment numeric] removed
+        list $installed $keys $healthy $removed [file exists [file join $environment lib numeric]] \
+            [dict size [::tclvenv::installed $environment]]
+    } -result {0 {{} { 12} 00 00/007 007 0x10 1e3 pkgIndex.tcl probe.tcl} 0 0 0 0}
+
+    test names-7.2 {a package with ~ names loads from the environment} -setup {
+        set environment [newEnvironment]
+        set source [package ~x]
+        manager install $environment $source
+    } -body {
+        lassign [runCommand [list [file join $environment bin tclsh]] \
+            [putBytes [file join $work load.tcl] "puts \[package require hostile_probe\]\n"]] status out
+        list $status [string trim $out]
+    } -result {0 1.0}
+
+    # --- 8: namespace directories ----------------------------------------------
+
+    test modules-8.1 {removing a namespaced module removes the directories it leaves empty} -setup {
+        set environment [newEnvironment]
+        file mkdir [file join $work modsrc]
+        set one [putBytes [file join $work modsrc a::b::one-1.0.tm] "package provide a::b::one 1.0\n"]
+        set two [putBytes [file join $work modsrc a::two-1.0.tm] "package provide a::two 1.0\n"]
+        manager install $environment $one
+        manager install $environment $two
+    } -body {
+        manager remove $environment a::b::one@1.0
+        set afterOne [lsort [glob -nocomplain -tails -directory [file join $environment modules] * */*]]
+        manager remove $environment a::two@1.0
+        list $afterOne [glob -nocomplain -tails -directory [file join $environment modules] *]
+    } -result {{a a/two-1.0.tm} {}}
+
+    # --- 9: a removal finishing during a read --------------------------------
+
+    test race-9.1 {list survives a pending removal's staging directory vanishing} -setup {
+        set environment [newEnvironment]
+        set source [package racing]
+        manager install $environment $source
+        set records [::tclvenv::installed $environment]
+        dict set records racing state removing
+        dict set records racing stage remove-vanished
+        file delete [file join $environment metadata installed.tcldata]
+        ::tclvenv::writeData [file join $environment metadata installed.tcldata] $records
+        # A removal finishing between a check and the next look: the path
+        # looks present, then isn't.
+        rename ::tclvenv::pathExists ::hostile::realPathExists
+        proc ::tclvenv::pathExists {path} {
+            expr {[string match */remove-vanished $path] ? 1 : [::hostile::realPathExists $path]}
+        }
+    } -body {
+        dict get [::tclvenv::installed $environment] racing state
+    } -cleanup {
+        rename ::tclvenv::pathExists {}
+        rename ::hostile::realPathExists ::tclvenv::pathExists
+    } -result removing
+
+    # --- 10: content hashes -----------------------------------------------------
+
+    set vectors {
+        0 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+        1 6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d
+        55 576a1bf8d4478657e6dc4af9398544765c2a92cde28478b019235cfed315fc09
+        56 9b20501dfd1d99161c257950f3444f3e49230c351c5c8e0943ef369f85f5205d
+        63 30b345906b493f06f69444b6521113511c242f30e29840462950035043682f1e
+        64 d8bc63b4fc1156e5e7d95a418b9bf54cd3174bedbc2db40f74895349b229b3c0
+        65 1ee23b0fbcaecc1aff4a9e8f1645f35ab2c8e13609cd73b68df8b5e3f63ce073
+        119 7a6589821178918ca8d9edaba5abfc1e9b2669564f4469b66885379c1530b2c8
+        120 655250427d56b1b0eeb8497d21428704273458a01772d6881b65c0abac0f8a98
+        128 54c9eb041badfd7064645067b107661fed6113197ce2dd066ba69618abd3732f
+        1000 89f4ff56a25dd1db06a4ce6033603775d705fb96f30f8693733fef602a1ca532
+        65537 a27cc6ee55a0fa3abecd0024125cd980cd84012591ecda5e7d0714145009badf
+    }
+    foreach {length expected} $vectors {
+        test hash-10.$length {SHA-256 across the padding and block boundaries, in one piece and in chunks} -body {
+            set data ""
+            for {set i 0} {$i < $length} {incr i} { append data [binary format cu [expr {($i * 7) % 256}]] }
+            set whole [::tclvenv::sha256Final [::tclvenv::sha256Update [::tclvenv::sha256Init] $data]]
+            set context [::tclvenv::sha256Init]
+            for {set at 0} {$at < $length} {incr at 13} {
+                set context [::tclvenv::sha256Update $context [string range $data $at [expr {$at + 12}]]]
+            }
+            list [expr {$whole eq $expected}] [expr {[::tclvenv::sha256Final $context] eq $expected}]
+        } -result {1 1}
+    }
+
+    test hash-10.records {receipts record size, CRC-32, SHA-256 and mtime for every file} -setup {
+        set environment [newEnvironment]
+        set source [package hashed {data "some package data\n"}]
+        manager install $environment $source
+    } -body {
+        set info [dict get [::tclvenv::installed $environment] hashed files data]
+        list [lsort [dict keys $info]] [dict get $info sha256] \
+            [expr {[dict get $info mtime] == [file mtime [file join $environment lib hashed data]]}]
+    } -result [list {crc32 mtime sha256 size type} [::tclvenv::sha256Final [::tclvenv::sha256Update [::tclvenv::sha256Init] "some package data\n"]] 1]
+
+    test hash-10.forged {a change keeping size and CRC-32 is detected, and removal refuses it} -setup {
+        set environment [newEnvironment]
+        set original "important original data, line one\nline two\n"
+        set source [package forged [list data $original]]
+        manager install $environment $source
+    } -body {
+        set path [file join $environment lib forged data]
+        set forged [forgeCrc $original HACKED]
+        putBytes $path $forged
+        lassign [manager doctor $environment] doctorStatus doctorOut doctorErr
+        lassign [manager remove $environment forged] removeStatus
+        list [expr {[string length $forged] == [string length $original]}] \
+            [expr {[zlib crc32 $forged] == [zlib crc32 $original]}] [expr {$forged ne $original}] \
+            $doctorStatus [string match "*installed files changed: forged*" $doctorErr] \
+            $removeStatus [expr {[getBytes $path] eq $forged}]
+    } -result {1 1 1 1 1 1 1}
+
+    test hash-10.restored {writing the original bytes back (with a new mtime) makes a package removable} -setup {
+        set environment [newEnvironment]
+        set source [package restored {data original}]
+        manager install $environment $source
+    } -body {
+        set path [file join $environment lib restored data]
+        putBytes $path changed
+        lassign [manager remove $environment restored] refused
+        putBytes $path original
+        file mtime $path [expr {[clock seconds] + 3600}]
+        lassign [manager doctor $environment] healthy
+        lassign [manager remove $environment restored] removed
+        list $refused $healthy $removed [file exists [file join $environment lib restored]]
+    } -result {1 0 0 0}
+
+    ::tclvenv::deleteOwned $work
+    removeDirectory $work
+    cleanupTests
+}

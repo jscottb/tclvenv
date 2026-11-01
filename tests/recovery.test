@@ -1,0 +1,587 @@
+package require tcltest 2
+# Interrupted commands and failing cleanup: stale locks, recovery of staged
+# transactions, truthful rollback, cleanup after a commit, and I/O errors
+# that name files.
+namespace eval ::recovery {
+    namespace import ::tcltest::*
+    variable project [file dirname [file dirname [file normalize [info script]]]]
+    source [file join $project lib manager.tcl]
+    variable host [info nameofexecutable]
+    variable cli [file join $project tclvenv.tcl]
+    variable work [makeDirectory "recovery-[pid]"]
+    variable count 0
+    testConstraint unix [expr {$::tcl_platform(platform) eq "unix"}]
+    testConstraint devFull [expr {$::tcl_platform(platform) eq "unix" && [file writable /dev/full]}]
+
+    proc putBytes {path data} {
+        file mkdir [file dirname $path]
+        set ch [open $path wb]
+        try { puts -nonewline $ch $data } finally { close $ch }
+        return $path
+    }
+    proc getBytes {path} {
+        set ch [open $path rb]
+        try { read $ch } finally { close $ch }
+    }
+    # Runs the manager: {status stdout stderr}.
+    proc manager {args} {
+        variable host
+        variable cli
+        variable work
+        set out [file join $work out]
+        set err [file join $work err]
+        set status 0
+        if {[catch {exec -- $host $cli {*}$args < /dev/null > $out 2> $err} message options]} {
+            set code [dict get $options -errorcode]
+            set status [expr {[lindex $code 0] eq "CHILDSTATUS" ? [lindex $code 2] : $message}]
+        }
+        list $status [getBytes $out] [getBytes $err]
+    }
+    proc fresh {} {
+        variable work
+        variable count
+        set path [file join $work dir[incr count]]
+        file mkdir $path
+        return $path
+    }
+    proc newEnvironment {} {
+        variable work
+        variable count
+        set path [file join $work env[incr count]]
+        lassign [manager create $path] status out err
+        if {$status != 0} { error "create failed: $err" }
+        return $path
+    }
+    # A package directory: name/pkgIndex.tcl and a few data files.
+    proc packageDir {name {extra {}}} {
+        set path [file join [fresh] $name]
+        putBytes [file join $path pkgIndex.tcl] \
+            "package ifneeded $name 1.0 \[list apply {{dir} {$extra; package provide $name 1.0}} \$dir\]\n"
+        putBytes [file join $path data] [string repeat "$name data\n" 100]
+        putBytes [file join $path sub more] more
+        return $path
+    }
+    proc ids {environment} {
+        lsort [dict keys [::tclvenv::readData [file join $environment metadata installed.tcldata]]]
+    }
+    proc libContents {environment} {
+        lsort [lmap name [glob -nocomplain -tails -directory [file join $environment lib] -- * .*] {
+            if {$name in {. ..}} continue
+            set name
+        }]
+    }
+    proc leftovers {environment} {
+        lsort [glob -nocomplain -tails -directory [file join $environment metadata] -- stage-* remove-* .tclvenv-* mutation.lock*]
+    }
+    proc healthy {environment} {
+        lindex [manager doctor $environment] 0
+    }
+    # A pid that existed and has exited (and been reaped).
+    proc deadPid {} {
+        variable host
+        exec -- $host << {puts [pid]}
+    }
+    proc lockFile {path data} {
+        putBytes $path "$data\n"
+    }
+
+    # Runs op (install SOURCE or remove ID) in a child that SIGKILLs itself
+    # at point; returns how the child ended.
+    proc crashAt {point environment op object} {
+        variable host
+        variable project
+        set script [putBytes [file join [fresh] crash.tcl] [string map [list @PROJECT@ $project] {
+            lassign $argv point root op object
+            source @PROJECT@/lib/manager.tcl
+            proc die {} { exec kill -KILL [pid] }
+            rename ::tclvenv::writeData ::tclvenv::realWriteData
+            proc ::tclvenv::writeData {path data} {
+                global point
+                if {$point eq "install-copy" && [file tail $path] eq "transaction.tcldata"} { die }
+                ::tclvenv::realWriteData $path $data
+                if {$point in {install-journal remove-journal} && [file tail $path] eq "transaction.tcldata"} { die }
+                if {[file tail $path] eq "installed.tcldata"} {
+                    if {$point eq "install-receipt"} { die }
+                    if {$point eq "remove-pending" && [string match *removing* $data]} { die }
+                }
+            }
+            rename ::tclvenv::openTemporary ::tclvenv::realOpenTemporary
+            proc ::tclvenv::openTemporary {directory pathVar args} {
+                global point
+                upvar 1 $pathVar path
+                set ch [::tclvenv::realOpenTemporary $directory path {*}$args]
+                if {$point eq "write-temp" && [file tail $directory] eq "metadata"} { die }
+                return $ch
+            }
+            rename ::tclvenv::moveExclusive ::tclvenv::realMoveExclusive
+            proc ::tclvenv::moveExclusive {source destination} {
+                global point
+                # A marker is in source now; the rename hasn't happened.
+                if {$point eq "install-marker" && [file tail $source] eq "payload"} {
+                    rename ::file ::realFile
+                    proc ::file {args} {
+                        if {[lindex $args 0] eq "rename"} { die }
+                        uplevel 1 [list ::realFile {*}$args]
+                    }
+                }
+                if {$point eq "remove-marker" && [file tail $destination] eq "payload"} {
+                    rename ::file ::realFile
+                    proc ::file {args} {
+                        if {[lindex $args 0] eq "rename"} { die }
+                        uplevel 1 [list ::realFile {*}$args]
+                    }
+                }
+                ::tclvenv::realMoveExclusive $source $destination
+                if {$point eq "install-publish" && [file tail $source] eq "payload"} { die }
+                if {$point eq "remove-detach" && [file tail $destination] eq "payload"} { die }
+            }
+            if {$op eq "install"} {
+                ::tclvenv::installTree $root $object
+            } else {
+                ::tclvenv::remove $root $object
+            }
+            puts "not interrupted"
+        }]]
+        if {[catch {exec -- $host $script $point $environment $op $object 2>@1} output options]} {
+            return [lindex [dict get $options -errorcode] 0]
+        }
+        return $output
+    }
+
+    # --- 1. Stale locks ----------------------------------------------------
+
+    test lock-stale-taken-over {a lock left by a dead process on this host is taken over} -constraints unix -body {
+        set environment [newEnvironment]
+        set lock [file join $environment metadata mutation.lock]
+        lockFile $lock [list host [info hostname] pid [deadPid]]
+        lassign [manager install $environment [packageDir stale]] status out err
+        list $status [ids $environment] [string match "*took over*no longer exists*" $err] [leftovers $environment]
+    } -result {0 stale 1 {}}
+
+    test lock-live-kept {a lock held by a running process is never taken over} -constraints unix -body {
+        variable host
+        set environment [newEnvironment]
+        set lock [file join $environment metadata mutation.lock]
+        set holder [open |[list $host] r+]
+        try {
+            lockFile $lock [list host [info hostname] pid [pid $holder]]
+            set before [getBytes $lock]
+            lassign [manager install $environment [packageDir live]] status out err
+            list $status [string match "*environment is locked*" $err] [expr {[getBytes $lock] eq $before}] [ids $environment]
+        } finally { close $holder }
+    } -result {1 1 1 {}}
+
+    test lock-other-shapes-kept {other hosts', old, garbled, directory and linked locks are never taken over} -constraints unix -body {
+        set result {}
+        foreach shape {host old garbage extra directory link} {
+            set environment [newEnvironment]
+            set lock [file join $environment metadata mutation.lock]
+            switch -- $shape {
+                host { lockFile $lock [list host not-[info hostname] pid [deadPid]] }
+                old { lockFile $lock "pid [deadPid]" }
+                garbage { lockFile $lock "host \{" }
+                extra { lockFile $lock [list host [info hostname] pid [deadPid] note x] }
+                directory { file mkdir $lock }
+                link { file link -symbolic $lock [putBytes [file join [fresh] target] [list host [info hostname] pid [deadPid]]] }
+            }
+            lassign [manager install $environment [packageDir shape]] status
+            lappend result $shape $status [file exists $lock]
+        }
+        set result
+    } -result {host 1 1 old 1 1 garbage 1 1 extra 1 1 directory 1 1 link 1 1}
+
+    test lock-breaker-live {a stale lock isn't broken while another process is breaking it} -constraints unix -body {
+        variable host
+        set environment [newEnvironment]
+        set lock [file join $environment metadata mutation.lock]
+        lockFile $lock [list host [info hostname] pid [deadPid]]
+        set holder [open |[list $host] r+]
+        try {
+            lockFile $lock.break [list host [info hostname] pid [pid $holder]]
+            lassign [manager install $environment [packageDir breaking]] status
+            list $status [file exists $lock] [file exists $lock.break]
+        } finally { close $holder }
+    } -result {1 1 1}
+
+    test lock-breaker-dead {a breaker left by a dead process is cleared, and the lock taken over at once} -constraints unix -body {
+        set environment [newEnvironment]
+        set lock [file join $environment metadata mutation.lock]
+        lockFile $lock [list host [info hostname] pid [deadPid]]
+        lockFile $lock.break [list host [info hostname] pid [deadPid]]
+        lassign [manager install $environment [packageDir broke]] status
+        list $status [ids $environment] [leftovers $environment]
+    } -result {0 broke {}}
+
+    test lock-doctor-stale {doctor names a stale lock and how to recover} -constraints unix -body {
+        set environment [newEnvironment]
+        lockFile [file join $environment metadata mutation.lock] [list host [info hostname] pid [deadPid]]
+        lassign [manager doctor $environment] status - err
+        lassign [manager recover $environment] status2
+        list $status [string match "*left by process*no longer exists; run: recover*" $err] $status2 [healthy $environment]
+    } -result {1 1 0 0}
+
+    test lock-record {a lock records this host and process} -body {
+        set lock [file join [fresh] lock]
+        ::tclvenv::takeLock $lock held
+        list [::tclvenv::lockHolder $lock] [catch {::tclvenv::takeLock $lock held} message] $message
+    } -result [list [list host [info hostname] pid [pid]] 1 held]
+
+    test lock-killed-while-creating {a process killed while creating its lock leaves no lock, and its record file is cleared} -constraints unix -body {
+        variable host
+        variable project
+        set environment [newEnvironment]
+        set script [putBytes [file join [fresh] die.tcl] [string map [list @PROJECT@ $project] {
+            source @PROJECT@/lib/manager.tcl
+            # Killed with the record written, before it becomes the lock.
+            rename ::file ::realFile
+            proc ::file {args} {
+                if {[lrange $args 0 1] eq {link -hard}} { exec kill -KILL [pid] }
+                uplevel 1 [list ::realFile {*}$args]
+            }
+            ::tclvenv::remove [lindex $argv 0] nothing
+        }]]
+        catch {exec -- $host $script $environment} message options
+        set metadata [file join $environment metadata]
+        set left [lsort [glob -nocomplain -tails -directory $metadata -- mutation.lock*]]
+        lassign [manager install $environment [packageDir afterkill]] status
+        list [lindex [dict get $options -errorcode] 0] [llength $left] [string match {mutation.lock.*-*} [lindex $left 0]] \
+            $status [ids $environment] [leftovers $environment]
+    } -result {CHILDKILLED 1 1 0 afterkill {}}
+
+    test lock-breaker-killed-while-creating {a takeover killed while creating its breaker leaves none, and the next one succeeds} -constraints unix -body {
+        variable host
+        variable project
+        set environment [newEnvironment]
+        set lock [file join $environment metadata mutation.lock]
+        lockFile $lock [list host [info hostname] pid [deadPid]]
+        set script [putBytes [file join [fresh] die.tcl] [string map [list @PROJECT@ $project] {
+            source @PROJECT@/lib/manager.tcl
+            # Killed with the breaker's record written, before it is linked.
+            rename ::file ::realFile
+            proc ::file {args} {
+                if {[lrange $args 0 1] eq {link -hard} && [string match *.break [lindex $args 2]]} {
+                    exec kill -KILL [pid]
+                }
+                uplevel 1 [list ::realFile {*}$args]
+            }
+            ::tclvenv::remove [lindex $argv 0] nothing
+        }]]
+        catch {exec -- $host $script $environment} message options
+        set breaker [file exists $lock.break]
+        lassign [manager install $environment [packageDir afterbreak]] status - err
+        list [lindex [dict get $options -errorcode] 0] $breaker $status [ids $environment] [leftovers $environment]
+    } -result {CHILDKILLED 0 0 afterbreak {}}
+
+    test lock-glob-characters {locks beside names holding glob characters work (no pattern is made from them)} -body {
+        set parent [file join [fresh] "p\[a\]{b}*?"]
+        file mkdir $parent
+        set root [file join $parent "env-\[>\\~\};?"]
+        lassign [manager create $root] s1 - e1
+        lassign [manager install $root [packageDir globbed]] s2 - e2
+        list $s1 $e1 $s2 $e2 [ids $root] [leftovers $root]
+    } -result {0 {} 0 {} globbed {}}
+
+    test create-stale-lock {an interrupted creation's lock and stage don't block creating it again} -constraints unix -body {
+        set parent [fresh]
+        set root [file join $parent env]
+        lockFile $root.tclvenv-create.lock [list host [info hostname] pid [deadPid]]
+        file mkdir [file join $parent .tclvenv-create-env.stage-0badf00d bin]
+        # Another destination's stage, and one not named as this tool names them.
+        file mkdir [file join $parent .tclvenv-create-envx.stage-0badf00d]
+        file mkdir [file join $parent .tclvenv-create-env.stage-keepme]
+        lassign [manager create $root] status out err
+        list $status [file isdirectory [file join $root bin]] [string match "*removed*interrupted creation*" $err] \
+            [lsort [lmap name [glob -nocomplain -tails -directory $parent -- * .*] {
+            if {$name in {. ..}} continue
+            set name
+        }]]
+    } -result {0 1 1 {.tclvenv-create-env.stage-keepme .tclvenv-create-envx.stage-0badf00d env}}
+
+    # --- 2. Recovery of interrupted operations -----------------------------
+
+    # Each point: {operation, what recovery leaves installed}.
+    foreach {point op expected} {
+        install-copy    install {}
+        install-journal install {}
+        install-marker  install {}
+        install-publish install {}
+        write-temp      install {}
+        install-receipt install crashed
+        remove-journal  remove  crashed
+        remove-marker   remove  crashed
+        remove-detach   remove  crashed
+    } {
+        test recover-$point "a command killed at $point is recovered: $op [expr {$expected eq {} ? {undone} : {kept}}]" -constraints unix -body {
+            set environment [newEnvironment]
+            set source [packageDir crashed]
+            if {$op eq "remove"} {
+                lassign [manager install $environment $source] installed
+                set object crashed
+            } else {
+                set installed 0
+                set object $source
+            }
+            set ended [crashAt $point $environment $op $object]
+            set left [llength [leftovers $environment]]
+            lassign [manager recover $environment] status out err
+            # (The only message: the dead process's lock was taken over.)
+            list $installed $ended [expr {$left > 0}] $status \
+                [regexp {^tclvenv: warning: took over [^\n]*mutation.lock from process \d+, which no longer exists\n$} $err] \
+                [ids $environment] [libContents $environment] [leftovers $environment] [healthy $environment]
+        } -result [list 0 CHILDKILLED 1 0 1 $expected $expected {} 0]
+    }
+
+    test recover-remove-pending {a committed removal is left for remove to finish} -constraints unix -body {
+        set environment [newEnvironment]
+        manager install $environment [packageDir pending]
+        set ended [crashAt remove-pending $environment remove pending]
+        lassign [manager recover $environment] status - err
+        lassign [manager remove $environment pending] status2
+        list $ended $status [string match "*unfinished removal of pending: run remove*" $err] $status2 \
+            [ids $environment] [leftovers $environment] [healthy $environment]
+    } -result {CHILDKILLED 1 1 0 {} {} 0}
+
+    test recover-automatic {the next install recovers first, then installs} -constraints unix -body {
+        set environment [newEnvironment]
+        set source [packageDir again]
+        crashAt install-publish $environment install $source
+        lassign [manager install $environment $source] status out err
+        list $status [string match "*Undid an interrupted install of again*Installed again*" $out] \
+            [string match "*took over*" $err] [ids $environment] [leftovers $environment] [healthy $environment]
+    } -result {0 1 1 again {} 0}
+
+    test recover-foreign-file {a stage holding unrecorded files is left, and said so} -constraints unix -body {
+        set environment [newEnvironment]
+        set stage [file join $environment metadata stage-foreign]
+        putBytes [file join $stage precious] keep
+        lassign [manager recover $environment] status - err
+        list $status [string match "*couldn't recover*stage-foreign*unrecorded files: precious*" $err] \
+            [getBytes [file join $stage precious]]
+    } -result {1 1 keep}
+
+    test recover-changed-destination {a published package changed since is left in place} -constraints unix -body {
+        set environment [newEnvironment]
+        set source [packageDir changed]
+        crashAt install-publish $environment install $source
+        putBytes [file join $environment lib changed data] edited
+        file delete -- [file join $environment metadata mutation.lock]
+        lassign [manager recover $environment] status - err
+        list $status [string match "*lib/changed is not what the interrupted install published*" $err] \
+            [getBytes [file join $environment lib changed data]] [ids $environment]
+    } -result {1 1 edited {}}
+
+    test recover-changed-payload {a detached package whose files changed is not restored or deleted} -constraints unix -body {
+        set environment [newEnvironment]
+        manager install $environment [packageDir moved]
+        crashAt remove-detach $environment remove moved
+        set payload [lindex [glob -directory [file join $environment metadata] remove-*] 0]/payload
+        putBytes [file join $payload data] edited
+        lassign [manager recover $environment] status - err
+        list $status [string match "*staged files changed*" $err] [getBytes [file join $payload data]] \
+            [libContents $environment]
+    } -result {1 1 edited {}}
+
+    test recover-invalid-journal {a journal naming a path outside the environment is refused} -constraints unix -body {
+        set environment [newEnvironment]
+        set stage [file join $environment metadata stage-evil]
+        set outside [putBytes [file join [fresh] victim data] keep]
+        putBytes [file join $stage transaction.tcldata] \
+            [dict create id evil target ../../[file tail [file dirname [file dirname $outside]]] files {{} {type directory}}]
+        lassign [manager recover $environment] status - err
+        list $status [string match "*invalid journal*" $err] [getBytes $outside]
+    } -result {1 1 keep}
+
+    test doctor-recover-hint {doctor says how to clear an unfinished operation} -body {
+        set environment [newEnvironment]
+        file mkdir [file join $environment metadata stage-empty]
+        lassign [manager doctor $environment] status - err
+        lassign [manager recover $environment] status2
+        list $status [string match "*unfinished package operation:*stage-empty; run: recover*" $err] $status2 \
+            [healthy $environment]
+    } -result {1 1 0 0}
+
+    # --- 3. Rollback that can't be completed is reported -------------------
+
+    test rollback-self-modifying {a package that writes into itself as its check fails is still rolled back} -body {
+        set dir [fresh]
+        set source [file join $dir swrite]
+        putBytes [file join $source pkgIndex.tcl] \
+            "package ifneeded swrite 1.0 \[list apply {{dir} {close \[open \[file join \$dir cache.dat\] w\]; error boom}} \$dir\]\n"
+        set environment [newEnvironment]
+        lassign [manager install $environment $source --check] status - err
+        list $status [string match "*swrite does not load in the environment, so nothing was installed: boom*" $err] \
+            [ids $environment] [libContents $environment] [healthy $environment]
+    } -result {1 1 {} {} 0}
+
+    test rollback-failure-reported {a rollback that fails is said, not hidden} -setup {
+        rename ::tclvenv::remove ::tclvenv::realRemove
+        proc ::tclvenv::remove {root id {discard 0}} { error "simulated: $id is busy" }
+    } -body {
+        set environment [newEnvironment]
+        set id [::tclvenv::installTree $environment [packageDir sfail {error nope}]]
+        set failed [catch {::tclvenv::finishInstall $environment [list $id] {deps 0 check 1 paths {}}} message]
+        list $failed $message [ids $environment]
+    } -cleanup {
+        rename ::tclvenv::remove {}
+        rename ::tclvenv::realRemove ::tclvenv::remove
+    } -result {1 {sfail does not load in the environment, and these could not be undone: sfail (simulated: sfail is busy) (see remove --discard-changes): nope} sfail}
+
+    test rollback-after-error-reported {an error's rollback failures are added to it} -setup {
+        rename ::tclvenv::remove ::tclvenv::realRemove
+        proc ::tclvenv::remove {root id {discard 0}} { if {$id eq "b"} { error "stuck" } }
+    } -body {
+        list [catch {::tclvenv::rollBackAfter [fresh] {a b} original {-code error}} message] $message
+    } -cleanup {
+        rename ::tclvenv::remove {}
+        rename ::tclvenv::realRemove ::tclvenv::remove
+    } -result {1 {original; these could not be undone: b (stuck) (see remove --discard-changes)}}
+
+    test remove-discard-changes {a changed package is refused, then removed with --discard-changes} -body {
+        set environment [newEnvironment]
+        manager install $environment [packageDir edited]
+        putBytes [file join $environment lib edited data] changed
+        putBytes [file join $environment lib edited added] new
+        lassign [manager remove $environment edited] s1 - e1
+        set kept [libContents $environment]
+        lassign [manager remove $environment edited --discard-changes] s2
+        lassign [manager remove $environment edited --discard-changes extra] s3 - e3
+        list $s1 [string match "*refusing to remove edited (remove --discard-changes*" $e1] $kept $s2 \
+            [ids $environment] [libContents $environment] [leftovers $environment] [healthy $environment] \
+            $s3 [string match *usage:* $e3]
+    } -result {1 1 edited 0 {} {} {} 0 1 1}
+
+    # --- 4. Cleanup after a commit doesn't change the outcome ---------------
+
+    test install-cleanup-warning {an install whose stage can't be removed succeeds, with a warning} -setup {
+        rename ::tclvenv::deleteOwned ::tclvenv::realDeleteOwned
+        proc ::tclvenv::deleteOwned {path} {
+            if {[string match stage-* [file tail $path]]} { error "simulated busy file" }
+            ::tclvenv::realDeleteOwned $path
+        }
+    } -body {
+        set environment [newEnvironment]
+        set id [::tclvenv::installTree $environment [packageDir tidy]]
+        set left [llength [glob -nocomplain -directory [file join $environment metadata] stage-*]]
+        rename ::tclvenv::deleteOwned {}
+        rename ::tclvenv::realDeleteOwned ::tclvenv::deleteOwned
+        lassign [manager recover $environment] status
+        list $id [ids $environment] $left $status [leftovers $environment] [healthy $environment]
+    } -cleanup {
+        if {[llength [info commands ::tclvenv::realDeleteOwned]]} {
+            rename ::tclvenv::deleteOwned {}
+            rename ::tclvenv::realDeleteOwned ::tclvenv::deleteOwned
+        }
+    } -errorOutput "tclvenv: warning: couldn't remove the staging directory *: simulated busy file\n" \
+        -match glob -result {tidy tidy 1 0 {} 0}
+
+    test lock-release-warning {a lock that can't be removed is a warning, not the outcome} -setup {
+        rename ::tclvenv::releaseLock ::tclvenv::realReleaseLock
+        proc ::tclvenv::releaseLock {root path} { error "simulated busy lock" }
+    } -body {
+        set environment [newEnvironment]
+        set result [::tclvenv::withLock $environment { set value done }]
+        list $result [file exists [file join $environment metadata mutation.lock]] $::tclvenv::mutationRoot
+    } -cleanup {
+        rename ::tclvenv::releaseLock {}
+        rename ::tclvenv::realReleaseLock ::tclvenv::releaseLock
+    } -errorOutput "tclvenv: warning: couldn't remove the lock file *: simulated busy lock\n" \
+        -match glob -result {done 1 {}}
+
+    test remove-cleanup-warning {a removal whose stage gained a file succeeds; the file is kept} -setup {
+        rename ::tclvenv::writeData ::tclvenv::realWriteData
+        proc ::tclvenv::writeData {path data} {
+            ::tclvenv::realWriteData $path $data
+            # Just after the removal commits, someone writes into its stage.
+            if {[file tail $path] eq "installed.tcldata" && ![dict exists $data late]} {
+                foreach stage [glob -nocomplain -directory [file dirname $path] remove-*] {
+                    ::recovery::putBytes [file join $stage precious] keep
+                }
+            }
+        }
+    } -body {
+        set environment [newEnvironment]
+        manager install $environment [packageDir late]
+        ::tclvenv::remove $environment late
+        set stage [lindex [glob -directory [file join $environment metadata] remove-*] 0]
+        list [ids $environment] [getBytes [file join $stage precious]]
+    } -cleanup {
+        rename ::tclvenv::writeData {}
+        rename ::tclvenv::realWriteData ::tclvenv::writeData
+    } -errorOutput "tclvenv: warning: couldn't remove the staging directory *\n" \
+        -match glob -output "Removed late\n" -result {{} keep}
+
+    # --- 5. I/O errors name files, not channels -----------------------------
+
+    test extract-names-file {a write that fails during extraction names the file} -constraints devFull -setup {
+        rename ::open ::recovery::realOpen
+        proc ::open {path args} {
+            if {[file tail $path] eq "victim" && [string match */out/* $path]} {
+                return [::recovery::realOpen /dev/full wb]
+            }
+            ::recovery::realOpen $path {*}$args
+        }
+    } -body {
+        set dir [fresh]
+        set archive [file join $dir a.tar]
+        set source [file join [fresh] p]
+        putBytes [file join $source pkgIndex.tcl] {}
+        putBytes [file join $source victim] [string repeat x 200000]
+        exec tar -C [file dirname $source] -cf $archive p
+        file mkdir [file join $dir out]
+        list [catch {::tclvenv::archive::extract $archive [file join $dir out]} message] \
+            [string match -nocase "*\"[file join $dir out p victim]\"*no space*" $message] \
+            [regexp {"file[0-9]+"} $message]
+    } -cleanup {
+        rename ::open {}
+        rename ::recovery::realOpen ::open
+    } -result {1 1 0}
+
+    test gunzip-names-file {a write that fails while decompressing names the temporary file} -constraints devFull -setup {
+        rename ::file ::recovery::realFile
+        proc ::file {args} {
+            if {[lindex $args 0] eq "tempfile"} {
+                upvar 1 [lindex $args 1] path
+                set path [::recovery::realFile join $::recovery::work decompressed]
+                close [open $path w]
+                return [open /dev/full wb]
+            }
+            uplevel 1 [list ::recovery::realFile {*}$args]
+        }
+    } -body {
+        set dir [fresh]
+        set source [file join [fresh] p]
+        putBytes [file join $source pkgIndex.tcl] {}
+        putBytes [file join $source data] [string repeat y 300000]
+        exec tar -C [file dirname $source] -czf [file join $dir a.tgz] p
+        list [catch {::tclvenv::archive::entries [file join $dir a.tgz]} message] \
+            [string match -nocase "couldn't decompress [file join $dir a.tgz]:*\"[file join $::recovery::work decompressed]\"*no space*" $message] \
+            [regexp {"file[0-9]+"} $message]
+    } -cleanup {
+        rename ::file {}
+        rename ::recovery::realFile ::file
+    } -result {1 1 0}
+
+    # --- 6. Fuzz cases that failed before their fixes ------------------------
+
+    source [file join $project tests fuzz.tcl]
+    # crashrecovery 9: recover killed between creating its lock and writing
+    # it left an empty lock no command could take over (and, with crashrecovery
+    # 29 and 44 on Tcl 9, the same for the breaker: lock-breaker-killed-*). (0, 3 and 20 were
+    # faults of the generator, kept as its regressions.)
+    # stalelocks 22: a destination name holding glob characters broke every
+    # lock taken beside it.
+    foreach {group index} {crashrecovery 0 crashrecovery 3 crashrecovery 9 crashrecovery 20 stalelocks 22} {
+        test fuzz-recovery-fixed-$group-$index {a previously failing recovery fuzz case passes} -constraints unix -body {
+            variable host
+            set report [file join [fresh] report]
+            set result [::fuzz::run [list $host [file join $project tests fuzz.tcl] \
+                --seed 1 --only $group --case $index --report-dir $report] [fresh]]
+            set summary [::fuzz::readData [file join $report summary.tcldata]]
+            list [dict get $result status] [dict get $summary total] [dict get $summary failed]
+        } -result {0 1 0}
+    }
+
+    ::tclvenv::deleteOwned $work
+    removeDirectory $work
+    cleanupTests
+}

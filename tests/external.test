@@ -1,0 +1,345 @@
+package require tcltest 2
+# Regressions for the findings of the external-oracle fuzz groups
+# (tests/FUZZ_EXTERNAL_REPORT.md), one or more per finding.
+namespace eval ::external {
+    namespace import ::tcltest::*
+    variable project [file dirname [file dirname [file normalize [info script]]]]
+    source [file join $project lib manager.tcl]
+    variable host [info nameofexecutable]
+    variable cli [file join $project tclvenv.tcl]
+    variable work [makeDirectory "external-[pid]"]
+    variable count 0
+    testConstraint unix [expr {$::tcl_platform(platform) eq "unix"}]
+    testConstraint gnutar [expr {$::tcl_platform(platform) eq "unix" && [auto_execok tar] ne "" &&
+        ![catch {exec -- tar --version} version] && [string match "*GNU tar*" $version]}]
+
+    proc putBytes {path data} {
+        file mkdir [file dirname $path]
+        set ch [open $path wb]
+        try { puts -nonewline $ch $data } finally { close $ch }
+        return $path
+    }
+    proc getBytes {path} {
+        set ch [open $path rb]
+        try { read $ch } finally { close $ch }
+    }
+    # Runs the manager: {status stdout stderr}.
+    proc manager {args} {
+        variable host
+        variable cli
+        variable work
+        set in [putBytes [file join $work stdin] ""]
+        set out [file join $work out]
+        set err [file join $work err]
+        set status 0
+        if {[catch {exec -- $host $cli {*}$args < $in > $out 2> $err} message options]} {
+            set code [dict get $options -errorcode]
+            set status [expr {[lindex $code 0] eq "CHILDSTATUS" ? [lindex $code 2] : $message}]
+        }
+        list $status [getBytes $out] [getBytes $err]
+    }
+    proc newEnvironment {} {
+        variable work
+        variable count
+        set path [file join $work env[incr count]]
+        lassign [manager create $path] status out err
+        if {$status != 0} { error "create failed: $err" }
+        return $path
+    }
+    proc fresh {} {
+        variable work
+        variable count
+        set path [file join $work dir[incr count]]
+        file mkdir $path
+        return $path
+    }
+    proc ids {environment} {
+        lassign [manager list $environment] status out
+        set out [encoding convertfrom utf-8 $out]
+        lsort [lmap line [split [string trim $out] \n] {lindex [split $line \t] 0}]
+    }
+    proc names {path} {
+        lmap entry [::tclvenv::archive::entries $path] {lindex $entry 0}
+    }
+
+    # --- Archive writers ----------------------------------------------------
+
+    proc field {value width} { return [format %0*o [expr {$width - 1}] $value]\0 }
+    # A tar header; magic is "ustar\0" + "00" (POSIX) or "ustar " + " \0"
+    # (old GNU, whose bytes 345-356 hold the atime, 357-368 the ctime).
+    proc tarHeader {name type size {gnu 0}} {
+        if {$gnu} {
+            set tail [binary format a6a2a32a32a8a8a12a12a131a12 "ustar " " \0" "" "" "" "" \
+                [field 15271251173 12] [field 15271251173 12] "" ""]
+        } else {
+            set tail [binary format a6a2a32a32a8a8a155a12 ustar\0 00 "" "" "" "" "" ""]
+        }
+        set header [binary format a100a8a8a8a12a12a8a1a100 $name [field 0o755 8] [field 0 8] \
+            [field 0 8] [field $size 12] [field 0 12] "        " $type ""]$tail
+        binary scan $header cu* bytes
+        set sum 0
+        foreach byte $bytes { incr sum $byte }
+        string replace $header 148 155 [format %06o $sum]\0\x20
+    }
+    proc padded {data} { string cat $data [string repeat \0 [expr {(512 - [string length $data] % 512) % 512}]] }
+    proc entry {name type data {gnu 0}} { string cat [tarHeader $name $type [string length $data] $gnu] [padded $data] }
+    # A pax record, its length counting itself.
+    proc paxRecord {key value} {
+        set body " $key=$value\n"
+        set length [string length $body]
+        while {[string length $length$body] != $length} { set length [string length $length$body] }
+        return $length$body
+    }
+    proc paxEntry {path data} {
+        set path [encoding convertto utf-8 $path]
+        set records [paxRecord path $path]
+        string cat [entry PaxHeaders/x x $records] [entry placeholder 0 $data]
+    }
+    proc endTar {} { string repeat \0 1024 }
+    # A zip of {name-bytes data flags} entries, stored.
+    proc zipBytes {entries} {
+        set out ""
+        set central ""
+        foreach item $entries {
+            lassign $item name data flags
+            set crc [zlib crc32 $data]
+            set mode [expr {[string match */ $name] ? 0o40755 : 0o100644}]
+            set offset [string length $out]
+            append out [binary format a4sssssiiiss PK\x03\x04 20 $flags 0 0 0 $crc \
+                [string length $data] [string length $data] [string length $name] 0] $name $data
+            append central [binary format a4ccsssssiiisssssii PK\x01\x02 20 3 20 $flags 0 0 0 \
+                $crc [string length $data] [string length $data] [string length $name] 0 0 0 0 \
+                [expr {$mode << 16}] $offset] $name
+        }
+        set start [string length $out]
+        append out $central [binary format a4ssssiis PK\x05\x06 0 0 [llength $entries] [llength $entries] \
+            [string length $central] $start 0]
+    }
+    variable index "package ifneeded ext 1.0 {package provide ext 1.0}\n"
+
+    # --- 3. pax paths holding newlines -------------------------------------
+
+    test pax-3.newline {a pax path is read by its length, newlines and all} -body {
+        variable index
+        set long pkg/[string repeat a 120]
+        set path [putBytes [file join [fresh] nl.tar] [string cat [entry pkg/pkgIndex.tcl 0 $index] \
+            [paxEntry $long\nb one] [paxEntry $long\nc two] [paxEntry pkg/end\n three] [endTar]]]
+        string map [list [string repeat a 120] A] [names $path]
+    } -result [list pkg/pkgIndex.tcl pkg/A\nb pkg/A\nc pkg/end\n]
+
+    test pax-3.install {such a file installs under its own name} -constraints unix -body {
+        variable index
+        set environment [newEnvironment]
+        set path [putBytes [file join [fresh] nl1.0.tar] [string cat [entry nl1.0/pkgIndex.tcl 0 $index] \
+            [paxEntry nl1.0/[string repeat é 60]\nb data] [endTar]]]
+        lassign [manager install $environment $path --no-deps --no-check] status - err
+        list $status $err [getBytes [file join $environment lib nl1.0 [string repeat é 60]\nb]]
+    } -result {0 {} data}
+
+    test pax-3.records {padding is allowed; a record whose length is wrong is refused} -body {
+        set result [list [::tclvenv::archive::paxPath "[paxRecord mtime 1][paxRecord path a\nb]\0\0\0"]]
+        foreach body [list "30 path=short\n" "5 path=x\n" "x path=a\n" "11 path=abc" "999999999999 path=a\n"] {
+            lappend result [catch {::tclvenv::archive::paxPath $body} message] $message
+        }
+        set result
+    } -result [list a\nb 1 {corrupt tar header (bad pax record)} 1 {corrupt tar header (bad pax record)} \
+        1 {corrupt tar header (bad pax record)} 1 {corrupt tar header (bad pax record)} \
+        1 {corrupt tar header (bad pax record)}]
+
+    # --- 4. zip names without the UTF-8 flag --------------------------------
+
+    test zip-4.cp437 {a name without the UTF-8 flag that isn't UTF-8 is CP 437} -body {
+        set path [putBytes [file join [fresh] names.zip] [zipBytes [list \
+            [list "\x82t\x82/" "" 0] [list "\x82t\x82/a" x 0] \
+            [list [encoding convertto utf-8 "été/b"] y 0] \
+            [list [encoding convertto utf-8 "été/c"] z 0x800]]]]
+        names $path
+    } -result [list été/ été/a été/b été/c]
+
+    test zip-4.install {such a directory is the package's, not a second one} -constraints unix -body {
+        variable index
+        set environment [newEnvironment]
+        set path [putBytes [file join [fresh] cp.zip] [zipBytes [list [list "\x82t\x82/" "" 0] \
+            [list "\x82t\x82/sub/" "" 0] [list [encoding convertto utf-8 "été/pkgIndex.tcl"] $index 0x800]]]]
+        lassign [manager install $environment $path --no-deps --no-check] status - err
+        list $status $err [ids $environment] [file isdirectory [file join $environment lib été sub]]
+    } -result [list 0 {} été 1]
+
+    # --- 5. old GNU headers and tar -G --------------------------------------
+
+    test gnu-5.times {old GNU times are not a prefix; dump directories are directories} -body {
+        variable index
+        set path [putBytes [file join [fresh] g.tar] [string cat [entry pkg/ D "pkgIndex.tcl\0\0" 1] \
+            [entry pkg/pkgIndex.tcl 0 $index 1] [endTar]]]
+        ::tclvenv::archive::entries $path
+    } -result [list {pkg/ directory 14} [list pkg/pkgIndex.tcl file [string length $index]]]
+
+    test gnu-5.incremental {an archive made by tar -G installs} -constraints gnutar -body {
+        variable index
+        set dir [fresh]
+        putBytes [file join $dir src inc1.0 pkgIndex.tcl] $index
+        putBytes [file join $dir src inc1.0 sub data] data
+        exec -- tar --format=gnu -G -C [file join $dir src] -cf [file join $dir inc.tar] inc1.0
+        set environment [newEnvironment]
+        lassign [manager install $environment [file join $dir inc.tar] --no-deps --no-check] status - err
+        list $status $err [ids $environment] [getBytes [file join $environment lib inc1.0 sub data]]
+    } -result {0 {} inc1.0 data}
+
+    # --- 6. redirect locations ----------------------------------------------
+
+    test url-6.rfc {the RFC 3986 section 5.4 examples} -body {
+        set base {http://a/b/c/d;p?q}
+        set wrong {}
+        foreach {reference expected} {
+            g:h g:h  g http://a/b/c/g  ./g http://a/b/c/g  g/ http://a/b/c/g/  /g http://a/g
+            //g http://g  ?y http://a/b/c/d;p?y  g?y http://a/b/c/g?y  #s http://a/b/c/d;p?q#s
+            g#s http://a/b/c/g#s  g?y#s http://a/b/c/g?y#s  ;x http://a/b/c/;x  g;x http://a/b/c/g;x
+            g;x?y#s http://a/b/c/g;x?y#s  . http://a/b/c/  ./ http://a/b/c/  .. http://a/b/
+            ../ http://a/b/  ../g http://a/b/g  ../.. http://a/  ../../ http://a/  ../../g http://a/g
+            ../../../g http://a/g  ../../../../g http://a/g  /./g http://a/g  /../g http://a/g
+            g. http://a/b/c/g.  .g http://a/b/c/.g  g.. http://a/b/c/g..  ..g http://a/b/c/..g
+            ./../g http://a/b/g  ./g/. http://a/b/c/g/  g/./h http://a/b/c/g/h  g/../h http://a/b/c/h
+            g;x=1/./y http://a/b/c/g;x=1/y  g;x=1/../y http://a/b/c/y  g?y/./x http://a/b/c/g?y/./x
+            g?y/../x http://a/b/c/g?y/../x  g#s/./x http://a/b/c/g#s/./x  g#s/../x http://a/b/c/g#s/../x
+        } {
+            set got [::tclvenv::resolveUrl $base $reference]
+            if {$got ne $expected} { lappend wrong $reference $got }
+        }
+        set wrong
+    } -result {}
+
+    test url-6.network {another host's path loses its dot segments; an empty one stays empty} -body {
+        lmap location {//g/./x/../y //g/a/.. //g //g?x=1 //g#f //h:8/a/../../b?q=../c} {
+            ::tclvenv::resolveUrl http://host/dir/file?q $location
+        }
+    } -result {http://g/y http://g/ http://g http://g?x=1 http://g#f http://h:8/b?q=../c}
+
+    # --- 1 and 2. downloads saved as sent -------------------------------------
+
+    # An HTTP server in a child process: routes maps a request target to the
+    # raw response bytes; each request line and its Accept-Encoding are
+    # appended to the log file.
+    proc startServer {routes log} {
+        variable host
+        variable work
+        set data [putBytes [file join $work routes.tcldata] [dict map {k v} $routes {binary encode base64 $v}]]
+        set script [putBytes [file join $work server.tcl] {
+            lassign $argv data log
+            set ch [open $data rb]
+            set routes [read $ch]
+            close $ch
+            proc serve {ch args} {
+                fconfigure $ch -translation binary
+                set line [string trimright [gets $ch] \r]
+                set encoding ""
+                while {[gets $ch header] >= 0 && [string trim $header] ne ""} {
+                    if {[regexp -nocase {^accept-encoding:\s*(.*?)\s*$} $header -> value]} { set encoding $value }
+                }
+                set out [open $::log a]
+                puts $out [list $line $encoding]
+                close $out
+                set target [lindex $line 1]
+                if {[dict exists $::routes $target]} {
+                    puts -nonewline $ch [binary decode base64 [dict get $::routes $target]]
+                } else {
+                    puts -nonewline $ch "HTTP/1.0 404 Not Found\r\nContent-Length: 0\r\n\r\n"
+                }
+                close $ch
+            }
+            set server [socket -server serve -myaddr 127.0.0.1 0]
+            puts [lindex [fconfigure $server -sockname] 2]
+            flush stdout
+            vwait forever
+        }]
+        set ch [open |[list $host $script $data $log] r]
+        list $ch [gets $ch]
+    }
+    proc stopServer {server} {
+        catch {exec kill [pid [lindex $server 0]]}
+        catch {close [lindex $server 0]}
+    }
+    proc demoTgz {} {
+        variable index
+        zlib gzip [string cat [entry dl1.0/pkgIndex.tcl 0 $index] [endTar]]
+    }
+    proc ok {body {headers ""}} {
+        string cat "HTTP/1.1 200 OK\r\nContent-Length: [string length $body]\r\n$headers" \
+            "Connection: close\r\n\r\n" $body
+    }
+
+    test download-1.labelled {a .tar.gz labelled with its own Content-Encoding is saved as sent} -constraints unix -body {
+        set dir [fresh]
+        set archive [putBytes [file join $dir dl1.0.tar.gz] [demoTgz]]
+        set log [file join $dir log]
+        set server [startServer [dict create /dl1.0.tar.gz [ok [demoTgz] "Content-Encoding: x-gzip\r\n"] \
+            /dl1.0.tgz [ok [demoTgz] "Content-Encoding: gzip\r\n"]] $log]
+        try {
+            set environment [newEnvironment]
+            set url http://127.0.0.1:[lindex $server 1]
+            set sha [::tclvenv::fileSha256 $archive]
+            lassign [manager install $environment $url/dl1.0.tar.gz --sha256 $sha --no-deps --no-check] s1 - e1
+            lassign [manager remove $environment dl1.0] s2
+            lassign [manager install $environment $url/dl1.0.tgz --sha256 $sha --no-deps --no-check] s3 - e3
+            # Nothing compressed was asked for.
+            set asked [lsort -unique [lmap line [split [string trim [getBytes $log]] \n] {lindex $line 1}]]
+            list $s1 $e1 $s2 $s3 $e3 [ids $environment] [expr {[string match -nocase *gzip* $asked] ? $asked : "no gzip"}]
+        } finally { stopServer $server }
+    } -result {0 {} 0 0 {} dl1.0 {no gzip}}
+
+    test download-2.trailing {bytes after Content-Length are not saved} -constraints unix -body {
+        set dir [fresh]
+        set archive [putBytes [file join $dir dl1.0.tar.gz] [demoTgz]]
+        set server [startServer [dict create /dl1.0.tar.gz "[ok [demoTgz]]trailing bytes, not the body"] \
+            [file join $dir log]]
+        try {
+            set environment [newEnvironment]
+            lassign [manager install $environment http://127.0.0.1:[lindex $server 1]/dl1.0.tar.gz \
+                --sha256 [::tclvenv::fileSha256 $archive] --no-deps --no-check] status - err
+            list $status $err [ids $environment]
+        } finally { stopServer $server }
+    } -result {0 {} dl1.0}
+
+    test download-2.download {download stops at Content-Length, saves to it without, and refuses a short body} -constraints unix -body {
+        set dir [fresh]
+        set body [string repeat abcdefgh 20000]
+        set server [startServer [dict create \
+            /long "[ok $body]extra" \
+            /close "HTTP/1.0 200 OK\r\n\r\n$body" \
+            /short "HTTP/1.0 200 OK\r\nContent-Length: [expr {[string length $body] + 10}]\r\n\r\n$body"] \
+            [file join $dir log]]
+        try {
+            set url http://127.0.0.1:[lindex $server 1]
+            set result {}
+            foreach target {long close} {
+                ::tclvenv::download $url/$target [file join $dir $target]
+                lappend result [expr {[getBytes [file join $dir $target]] eq $body}]
+            }
+            lappend result [catch {::tclvenv::download $url/short [file join $dir short]} message] $message
+        } finally { stopServer $server }
+    } -match glob -result {1 1 1 {download failed (eof): *}}
+
+    test download-limit {the size limit holds for announced and unannounced bodies} -constraints unix -body {
+        set dir [fresh]
+        set body [string repeat x 300000]
+        set server [startServer [dict create /announced [ok $body] /unannounced "HTTP/1.0 200 OK\r\n\r\n$body"] \
+            [file join $dir log]]
+        set ::env(TCLVENV_ARCHIVE_LIMIT) 100000
+        try {
+            set url http://127.0.0.1:[lindex $server 1]
+            set result {}
+            foreach target {announced unannounced} {
+                set file [file join $dir $target]
+                lappend result [catch {::tclvenv::download $url/$target $file} message] $message \
+                    [expr {[file size $file] <= 100000}]
+            }
+            set result
+        } finally {
+            unset ::env(TCLVENV_ARCHIVE_LIMIT)
+            stopServer $server
+        }
+    } -match glob -result {1 {download exceeds the size limit: *} 1 1 {download exceeds the size limit: *} 1}
+
+    ::tclvenv::deleteOwned $work
+    removeDirectory $work
+    cleanupTests
+}

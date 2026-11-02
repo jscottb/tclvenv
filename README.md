@@ -26,6 +26,7 @@ sh install.sh --user           # ~/.local/bin/tclvenv, files in ~/.local/share/t
 sh install.sh --user-bin       # ~/bin/tclvenv, files in ~/.local/share/tclvenv
 sudo sh install.sh --system    # /usr/local/bin/tclvenv, files in /usr/local/share/tclvenv
 sh install.sh --prefix ~/tools # ~/tools/bin/tclvenv, files in ~/tools/share/tclvenv
+sh install.sh --venv           # run it inside its own tclvenv
 ```
 
 `--bindir DIR` and `--datadir DIR` place the command and the files apart.
@@ -41,12 +42,47 @@ one first (removed again on uninstall). A file it can't change (read-only,
 a dangling link) is skipped with a warning. `--no-path` only says what to
 add. A system install edits no one's startup files.
 
-Reinstalling (to upgrade) replaces the files in one step and keeps the PATH
-lines. The installer refuses to overwrite a `tclvenv` command or directory
-it didn't create (`--force` replaces such a command). `--dry-run` shows what
-would be done. `sh install.sh --uninstall` with the same location options
-removes the command, the files and the PATH lines; environments already
-created keep working, since each holds its own copy of what it needs.
+To update, run `sh install.sh --upgrade` from a newer checkout. It finds the
+install (the `tclvenv` on `PATH`, else `~/.local/bin`, `~/bin`, `/usr/local/bin`,
+or the location you give), replaces only its files in one step, keeps its place,
+its Tcl and its PATH lines, and asks nothing. It says so if nothing has changed,
+and fails if there is nothing to upgrade. It refuses a version older than the one
+installed unless given `--force`. Environments keep the version they were made
+with. Running the installer without `--upgrade` is a full install: it chooses
+place, Tcl and PATH lines afresh, and replaces what is at that location.
+
+The installer refuses to overwrite a `tclvenv` command or directory it didn't
+create (`--force` replaces such a command). `--dry-run` shows what would be done.
+`sh install.sh --uninstall` finds an install the same way (on a terminal it asks
+first; give a location to skip the search) and removes the command, the files and
+the PATH lines; environments already created keep working, since each holds its
+own copy of what it needs.
+
+Each install, upgrade and reinstall appends to a log, `.install-log` in the files
+directory, one line per file and action with the local time: `add`, `update`, `unchanged` and
+`remove` for files, `path-add` and `path-skip` for startup files, between `begin` and
+`end` lines naming the version, source, Tcl and user. A failure is a `failed` line. The
+log goes when the install does, and an install that was up to date adds nothing, so
+`--log FILE` also writes to a file of your choice, which `--uninstall` leaves, with what
+it removed. `--dry-run` writes no log.
+
+`--venv [DIR]` creates a tclvenv and runs the command inside it, so that the command
+is pinned to one Tcl and sees only the packages in that environment. `DIR` defaults
+to `venv` in the files directory. `--tclvenv CMD` (or `TCLVENV_TCLVENV`) names the tclvenv
+command, or `tclvenv.tcl`, that creates it; the default is this checkout's own `tclvenv.tcl`. An environment
+already at `DIR` is used as it is. From then on the install keeps its environment:
+`--upgrade` and a reinstall leave it alone (and make it again if it has gone), asking
+for another `DIR` is refused until you uninstall, and `--tcl` doesn't change it. If it
+stops working because its Tcl was upgraded, remove the directory and run `--upgrade`.
+`--uninstall` removes an environment it created or that sits in the files directory,
+and leaves one that was there already. The command still works on your setup rather
+than its own: `--tcl tclsh` finds the `tclsh` on your `PATH`, not the environment's.
+
+`--dry-run` shows what would be done, for an install, an upgrade or an uninstall, and
+changes nothing.
+
+`install.sh` is the same in tclvenv and [tclpkg](../tclpkg), apart from the few
+settings at its top.
 
 ## Quick start
 
@@ -104,7 +140,9 @@ so shells never evaluate it, and runs no external command. `deactivate`
 restores `PATH`, `TCLVENV` and `PS1`, including whether `TCLVENV` was
 exported. When another tool (a Python venv, for example) already defined
 `deactivate`, activation leaves it alone and says so: leave the environment
-with `tclvenv_deactivate`, which is always defined. `create` refuses a
+with `tclvenv_deactivate`, which is always defined. `bin/deactivate` does the
+same when sourced (`. .venv/bin/deactivate`); it isn't executable, because a
+child process can't change the shell. `create` refuses a
 destination whose path contains the `PATH` separator (`:`; `;` on Windows),
 since it could not be activated.
 The POSIX launcher uses `exec` so the Tcl application receives process signals
@@ -154,6 +192,20 @@ Application code uses ordinary Tcl package loading:
 package require greeting 1.0
 package require salute 1.0
 ```
+
+`export` writes the packages as a requirements file, one `NAME==VERSION` per
+line, which [tclpkg](../tclpkg) installs into another environment or folder:
+
+```sh
+tclsh tclvenv.tcl export .venv --output requirements.txt    # or to standard output
+tclpkg install -r requirements.txt --venv other
+```
+
+It reads tclpkg's records, `add`'s and each index's text, and runs no package's
+code. A package whose index computes its version is listed without one, and one
+whose index declares no package plainly is only a comment, with a warning. It says
+what is installed, not where it came from: a package from a local directory or a
+URL is listed by name, and tclpkg looks for that name in its repositories.
 
 Package directories retain their basename under `lib/`. Their installation ID
 is that basename, as written (`~x` stays `~x` on Tcl 8.6 as on 9). Names

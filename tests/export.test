@@ -1,0 +1,146 @@
+# tclvenv export: an environment's packages as a requirements file.
+package require tcltest 2
+namespace import ::tcltest::*
+set project [file dirname [file dirname [file normalize [info script]]]]
+set cli [file join $project tclvenv.tcl]
+set host [info nameofexecutable]
+set scratch [makeDirectory "export test's \$workspace-[pid]"]
+set counter 0
+
+proc writeTestFile {path text} {
+    file mkdir [file dirname $path]
+    set ch [open $path w]
+    fconfigure $ch -encoding utf-8 -translation lf
+    puts -nonewline $ch $text
+    close $ch
+    return $path
+}
+proc readTestFile {path} {
+    set ch [open $path r]
+    try { read $ch } finally { close $ch }
+}
+proc manager {args} { exec -ignorestderr -- $::host $::cli {*}$args 2>@1 }
+proc newEnv {} {
+    set root [file join $::scratch env[incr ::counter]]
+    manager create $root --tcl $::host
+    return $root
+}
+# An index in a new directory of this name, installed in root.
+proc addDirectory {root name index} {
+    set directory [file join $::scratch src[incr ::counter] $name]
+    writeTestFile [file join $directory pkgIndex.tcl] $index
+    manager install $root $directory
+}
+# The lines that aren't the header.
+proc exported {root} {
+    set lines [split [string trim [manager export $root]] \n]
+    lrange $lines 1 end
+}
+
+test export-1.1 {a directory by its index, and a module by its name} -setup {
+    set root [newEnv]
+    addDirectory $root greeting1.0 "package ifneeded greeting 1.0 \[list source \$dir/g.tcl\]\n"
+    manager install $root [writeTestFile [file join $scratch src[incr counter] salute-1.5.tm] "package provide salute 1.5\n"]
+} -body { exported $root } -result {greeting==1.0 salute==1.5}
+
+test export-1.2 {an empty environment is only the header} -setup {
+    set root [newEnv]
+} -body { exported $root } -result {}
+
+test export-1.3 {sorted, whatever order they came in} -setup {
+    set root [newEnv]
+    foreach name {zebra apple mango} { addDirectory $root $name-1.0 "package ifneeded $name 1.0 {}\n" }
+} -body { exported $root } -result {apple==1.0 mango==1.0 zebra==1.0}
+
+test export-1.4 {a directory goes by the package its name says} -setup {
+    set root [newEnv]
+    addDirectory $root main-1.0 "package ifneeded helper 3.0 {}\npackage ifneeded main 1.0 {}\n"
+} -body { exported $root } -result main==1.0
+
+test export-1.5 {else by everything it declares} -setup {
+    set root [newEnv]
+    addDirectory $root bundle "package ifneeded one 1.0 {}\npackage ifneeded two 2.0 {}\n"
+} -body { exported $root } -result {one==1.0 two==2.0}
+
+test export-1.6 {a computed version isn't pinned} -setup {
+    set root [newEnv]
+    addDirectory $root calc-1.0 "set v 1.0\npackage ifneeded calc \$v {}\n"
+} -body { exported $root } -result calc
+
+test export-1.7 {nor is a version chosen by Tcl} -setup {
+    set root [newEnv]
+    addDirectory $root both "if {\$x} {package ifneeded both 1.0 {}} else {package ifneeded both 2.0 {}}\n"
+} -body { exported $root } -result both
+
+test export-1.8 {a declaration in a comment doesn't count} -setup {
+    set root [newEnv]
+    addDirectory $root real-1.0 "# package ifneeded old 0.1 {}\npackage ifneeded real 1.0 {}\n"
+} -body { exported $root } -result real==1.0
+
+test export-1.9 {a package it can't name is a comment, and a warning} -setup {
+    set root [newEnv]
+    addDirectory $root mystery "source \$dir/more.tcl\n"
+} -body {
+    set output [manager export $root]
+    list [string match {*# mystery: its index doesn't plainly declare a package*} $output] \
+        [string match {*warning*mystery*} $output]
+} -result {1 1}
+
+test export-1.10 {index code isn't run} -setup {
+    set root [newEnv]
+    set marker [file join $scratch marker[incr counter]]
+    addDirectory $root loud-1.0 "close \[open [list $marker] w\]\npackage ifneeded loud 1.0 {}\n"
+} -body {
+    list [exported $root] [file exists $marker]
+} -result {loud==1.0 0}
+
+test export-1.11 {a system package goes by the name it was added under} -setup {
+    set root [newEnv]
+    set system [file join $scratch system[incr counter]]
+    writeTestFile [file join $system lib-dir pkgIndex.tcl] "package ifneeded added 2.5 {package provide added 2.5}\n"
+    manager add $root added --path $system
+} -body { exported $root } -result added==2.5
+
+test export-2.1 {--output replaces the file, and leaves nothing else} -setup {
+    set root [newEnv]
+    addDirectory $root greeting1.0 "package ifneeded greeting 1.0 {}\n"
+    set directory [file join $scratch out[incr counter]]
+    set file [writeTestFile [file join $directory requirements.txt] "old\n"]
+} -body {
+    set said [manager export $root --output $file]
+    list $said [lrange [split [string trim [readTestFile $file]] \n] 1 end] \
+        [lmap f [glob -directory $directory *] {file tail $f}]
+} -result {{} greeting==1.0 requirements.txt}
+
+test export-2.2 {a new file is readable like any other} -constraints unix -setup {
+    set root [newEnv]
+    set file [file join $scratch out[incr counter].txt]
+    set before [file join $scratch ordinary[incr counter]]
+    close [open $before w]
+} -body {
+    manager export $root --output $file
+    expr {[file attributes $file -permissions] == [file attributes $before -permissions]}
+} -result 1
+
+test export-2.3 {not an environment} -body {
+    catch {manager export [file join $scratch nothing]} message
+    string match {*tclvenv*} $message
+} -result 1
+
+test export-2.4 {usage} -body {
+    catch {manager export} message
+    set message
+} -match glob -result {*usage: export ENV*}
+
+test export-2.5 {it changes nothing} -setup {
+    set root [newEnv]
+    addDirectory $root greeting1.0 "package ifneeded greeting 1.0 {}\n"
+    set before [readTestFile [file join $root metadata installed.tcldata]]
+} -body {
+    manager export $root
+    list [expr {$before eq [readTestFile [file join $root metadata installed.tcldata]]}] \
+        [string match {*OK*} [manager doctor $root]]
+} -result {1 1}
+
+removeDirectory $scratch
+cleanupTests

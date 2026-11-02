@@ -243,6 +243,595 @@ namespace eval ::installsh {
             [expr {[file join $prefix bin] in [split $path :]}]
     } -result {1 1 1 0}
 
+    # ---- --upgrade and --uninstall: the same tests in tclvenv and tclpkg ----
+    proc inst {home args} { install dash $home {*}$args }
+    # With extra environment settings for one call.
+    proc instWith {settings home args} {
+        variable extra
+        set extra $settings
+        try { install dash $home {*}$args } finally { set extra {} }
+    }
+    proc data {home} { file join $home .local share tclvenv }
+    proc tamper {home} { putText [file join [data $home] lib stale.tcl] "# old\n" }
+    proc fakeTcl {dir body} {
+        set path [putText [file join $dir tclsh] "#!/bin/sh\n$body\n"]
+        file attributes $path -permissions 0755
+        return $path
+    }
+
+    test upgrade-1.1 {finds the install on PATH, and updates its files} -constraints dash -body {
+        set home [fresh home]
+        set prefix [fresh prefix]
+        inst $home --prefix $prefix --no-path
+        putText [file join $prefix share tclvenv lib stale.tcl] "# old\n"
+        lassign [instWith [list PATH=[file join $prefix bin]:$::installsh::basePath] $home --upgrade] status out
+        list $status [string match {*Upgrading tclvenv*} $out] [file exists [file join $prefix share tclvenv lib stale.tcl]] \
+            [file exists [data $home]] [catch {exec [file join $prefix bin tclvenv] --version}]
+    } -result {0 1 0 0 0}
+
+    foreach {n where place} {2 --user {.local bin} 3 --user-bin bin} {
+        test upgrade-1.$n "finds $where off PATH" -constraints dash -body {
+            set home [fresh home]
+            inst $home $where --no-path
+            tamper $home
+            lassign [inst $home --upgrade] status
+            list $status [file exists [file join [data $home] lib stale.tcl]] [file executable [file join $home {*}$place tclvenv]]
+        } -result {0 0 1}
+    }
+
+    test upgrade-1.4 {a location given is used, and a --datadir install keeps its command} -constraints dash -body {
+        set home [fresh home]
+        set files [file join [fresh files] here]
+        set bin [fresh bin]
+        inst $home --bindir $bin --datadir $files --no-path
+        putText [file join $files lib stale.tcl] "# old\n"
+        lassign [inst $home --upgrade --datadir $files] status
+        list $status [file exists [file join $files lib stale.tcl]] [file executable [file join $bin tclvenv]] \
+            [file exists [file join $home .local bin tclvenv]]
+    } -result {0 0 1 0}
+
+    test upgrade-2.1 {nothing there: fails, and creates nothing} -constraints dash -body {
+        set home [fresh home]
+        lassign [inst $home --upgrade] status out err
+        list $status [string match {*no tclvenv found to upgrade*} $err] [tree $home]
+    } -result {1 1 {}}
+
+    test upgrade-2.2 {nothing at the location given} -constraints dash -body {
+        set home [fresh home]
+        lassign [inst $home --upgrade --prefix [file join $home none]] status out err
+        list $status [string match {*no tclvenv installed by this script*} $err] [tree $home]
+    } -result {1 1 {}}
+
+    test upgrade-2.3 {already up to date: says so and writes nothing} -constraints dash -body {
+        set home [fresh home]
+        inst $home --user --no-path
+        set manifest [file join [data $home] .install-manifest]
+        putText $manifest [getText $manifest]
+        file mtime $manifest 1000000000
+        lassign [inst $home --upgrade] status out
+        list $status [string match {*already up to date*} $out] [file mtime $manifest]
+    } -result {0 1 1000000000}
+
+    test upgrade-2.4 {--force copies again} -constraints dash -body {
+        set home [fresh home]
+        inst $home --user --no-path
+        lassign [inst $home --upgrade --force] status out
+        list $status [string match {*Upgrading*} $out]
+    } -result {0 1}
+
+    test upgrade-2.5 {a missing command is written again} -constraints dash -body {
+        set home [fresh home]
+        inst $home --user --no-path
+        file delete [file join $home .local bin tclvenv]
+        lassign [inst $home --upgrade --datadir [data $home]] status
+        list $status [file executable [file join $home .local bin tclvenv]]
+    } -result {0 1}
+
+    test upgrade-3.1 {PATH lines are left alone, and nothing is said about PATH} -constraints dash -body {
+        set home [fresh home]
+        inst $home --user --path
+        set profile [getText [file join $home .profile]]
+        tamper $home
+        lassign [inst $home --upgrade] status out
+        list $status [expr {$profile eq [getText [file join $home .profile]]}] [string match *PATH* $out] \
+            [string match *startup-file* [getText [file join [data $home] .install-manifest]]]
+    } -result {0 1 0 1}
+
+    test upgrade-3.2 {none are added either} -constraints dash -body {
+        set home [fresh home]
+        inst $home --user --no-path
+        tamper $home
+        inst $home --upgrade
+        file exists [file join $home .profile]
+    } -result 0
+
+    test upgrade-3.3 {keeps its Tcl} -constraints dash -body {
+        set home [fresh home]
+        set real [lindex [auto_execok tclsh8.6] 0]
+        if {$real eq ""} { set real [info nameofexecutable] }
+        inst $home --user --no-path --tcl $real
+        tamper $home
+        inst $home --upgrade
+        string match "*tcl $real*" [getText [file join [data $home] .install-manifest]]
+    } -result 1
+
+    test upgrade-3.4 {--tcl changes it} -constraints dash -body {
+        set home [fresh home]
+        set link [file join [fresh link] mytcl]
+        file link -symbolic $link [info nameofexecutable]
+        inst $home --user --no-path
+        lassign [inst $home --upgrade --tcl $link] status out
+        list $status [string match "*tcl $link*" [getText [file join [data $home] .install-manifest]]]
+    } -result {0 1}
+
+    test upgrade-3.5 {a Tcl that's gone is reported, and --tcl gets past it} -constraints dash -body {
+        set home [fresh home]
+        set link [file join [fresh link] mytcl]
+        file link -symbolic $link [info nameofexecutable]
+        inst $home --user --no-path --tcl $link
+        file delete $link
+        lassign [inst $home --upgrade] status out err
+        lassign [inst $home --upgrade --tcl [info nameofexecutable]] second
+        list $status [string match {*Tcl is gone*} $err] $second
+    } -result {1 1 0}
+
+    test upgrade-4.1 {an older version is refused, and --force goes back} -constraints dash -body {
+        set home [fresh home]
+        inst $home --user --no-path
+        set manifest [file join [data $home] .install-manifest]
+        set text [getText $manifest]
+        regsub -line {^version .*$} $text {version 99.0} changed
+        putText $manifest $changed
+        lassign [inst $home --upgrade] status out err
+        lassign [inst $home --upgrade --force] forced
+        list $status [string match {*newer than this checkout*} $err] $forced \
+            [string match {*version 99.0*} [getText $manifest]]
+    } -result {1 1 0 0}
+
+    test upgrade-4.2 {an upgrade doesn't move the command} -constraints dash -body {
+        set home [fresh home]
+        inst $home --user --no-path
+        lassign [inst $home --upgrade --user --bindir [fresh other]] status out err
+        list $status [string match {*doesn't move it*} $err]
+    } -result {1 1}
+
+    test upgrade-4.3 {not with --uninstall} -constraints dash -body {
+        lassign [inst [fresh home] --upgrade --uninstall] status out err
+        list $status [string match {*together*} $err]
+    } -result {1 1}
+
+    test upgrade-4.4 {new files that don't run change nothing} -constraints dash -body {
+        set home [fresh home]
+        inst $home --user --no-path
+        tamper $home
+        set tcl [fakeTcl [fresh fake] {[ $# -eq 0 ] && { echo 8.6.18; exit 0; }; exit 1}]
+        lassign [inst $home --upgrade --tcl $tcl] status out err
+        list $status [string match {*nothing was changed*} $err] [file exists [file join [data $home] lib stale.tcl]] \
+            [lsearch -all -inline [glob -nocomplain -tails -directory [file join $home .local share] .*] .tclvenv*]
+    } -result {1 1 1 {}}
+
+    test upgrade-4.5 {--dry-run changes nothing} -constraints dash -body {
+        set home [fresh home]
+        inst $home --user --no-path
+        tamper $home
+        set before [tree $home]
+        lassign [inst $home --upgrade --dry-run] status out
+        list $status [string match {*would copy*} $out] [expr {$before eq [tree $home]}]
+    } -result {0 1 1}
+
+    test upgrade-4.6 {a failed move keeps the old files} -constraints dash -body {
+        set home [fresh home]
+        inst $home --user --no-path
+        tamper $home
+        set stub [fresh stub]
+        set mv [putText [file join $stub mv] "#!/bin/sh\ncase \"\$2\" in *.tclvenv-install.*) exit 1;; esac\nexec /bin/mv \"\$@\"\n"]
+        file attributes $mv -permissions 0755
+        lassign [instWith [list PATH=$stub:$::installsh::basePath] $home --upgrade] status out err
+        list $status [string match {*old ones are kept*} $err] [file exists [file join [data $home] lib stale.tcl]]
+    } -result {1 1 1}
+
+    test install-tcl-1 {an active environment's Tcl isn't what the command keeps} -constraints dash -body {
+        set home [fresh home]
+        set active [fresh active]
+        fakeTcl [file join $active bin] {echo 8.6.18}
+        lassign [instWith [list TCLVENV=$active PATH=[file join $active bin]:$::installsh::basePath] $home --user --no-path] status
+        list $status [string match "*tcl $active*" [getText [file join [data $home] .install-manifest]]]
+    } -result {0 0}
+
+    test uninstall-1.1 {finds the install on PATH} -constraints dash -body {
+        set home [fresh home]
+        set prefix [fresh prefix]
+        inst $home --prefix $prefix --no-path
+        lassign [instWith [list PATH=[file join $prefix bin]:$::installsh::basePath] $home --uninstall] status
+        list $status [file exists [file join $prefix bin tclvenv]] [file exists [file join $prefix share tclvenv]]
+    } -result {0 0 0}
+
+    foreach {n where place} {2 --user {.local bin} 3 --user-bin bin} {
+        test uninstall-1.$n "finds $where off PATH, and its PATH lines" -constraints dash -body {
+            set home [fresh home]
+            inst $home $where --path
+            lassign [inst $home --uninstall] status
+            list $status [file exists [file join $home {*}$place tclvenv]] [file exists [data $home]] [blocks [file join $home .profile]]
+        } -result {0 0 0 0}
+    }
+
+    test uninstall-1.4 {a location given wins over one that would be found} -constraints dash -body {
+        set home [fresh home]
+        set prefix [fresh prefix]
+        inst $home --user --no-path
+        inst $home --prefix $prefix --no-path
+        lassign [inst $home --uninstall --prefix $prefix] status
+        list $status [file exists [file join $prefix bin tclvenv]] [file exists [file join $home .local bin tclvenv]]
+    } -result {0 0 1}
+
+    test uninstall-1.5 {nothing there} -constraints dash -body {
+        lassign [inst [fresh home] --uninstall] status out err
+        list $status [string match {*no tclvenv installed by this script*} $err]
+    } -result {1 1}
+
+    test uninstall-1.6 {a command that isn't this script's isn't found} -constraints dash -body {
+        set home [fresh home]
+        set mine [putText [file join $home .local bin tclvenv] "#!/bin/sh\necho mine\n"]
+        lassign [inst $home --uninstall] status
+        list $status [getText $mine]
+    } -result [list 1 "#!/bin/sh\necho mine\n"]
+
+    test uninstall-1.7 {--dry-run removes nothing} -constraints dash -body {
+        set home [fresh home]
+        inst $home --user --no-path
+        lassign [inst $home --uninstall --dry-run] status
+        list $status [file exists [file join $home .local bin tclvenv]] [file exists [data $home]]
+    } -result {0 1 1}
+
+    foreach {n answer gone} {8 n 0 9 y 1} {
+        test uninstall-1.$n "on a terminal it asks: $answer" -constraints {pty dash} -body {
+            set home [fresh home]
+            inst $home --user --no-path
+            set answers [putText [file join [fresh answers] in] "$answer\n"]
+            exec -- env -i HOME=$home PATH=$::installsh::basePath TERM=dumb script -qec [list dash $::installsh::script --uninstall] /dev/null < $answers
+            expr {![file exists [file join $home .local bin tclvenv]]}
+        } -result $gone
+    }
+
+    # ---- the install log: the same tests in tclvenv and tclpkg ----
+    proc logOf {home} { getText [file join [data $home] .install-log] }
+    # A log's lines without their times.
+    proc actions {text} { lmap line [split [string trim $text] \n] { lrange [split $line " "] 1 end } }
+    # The action of a line about this path, relative to the files directory.
+    proc actionOn {home text relative} {
+        foreach line [actions $text] {
+            if {[lindex $line 1] eq [file join [data $home] $relative]} { return [lindex $line 0] }
+        }
+        return none
+    }
+
+    test log-1.1 {an install logs each file, the command and PATH lines, with times} -constraints dash -body {
+        set home [fresh home]
+        lassign [inst $home --user --path] status out
+        set text [logOf $home]
+        set command [file join $home .local bin tclvenv]
+        list $status [string match "*Log: [data $home]/.install-log*" $out] \
+            [regexp {^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d[+-]\d{4} begin install tclvenv version=} $text] \
+            [actionOn $home $text tclvenv.tcl] [actionOn $home $text README.md] \
+            [string match "* add $command\n*" $text] [string match "* path-add [file join $home .profile] *" $text] \
+            [string match "* end install\n" $text]
+    } -result {0 1 1 add add 1 1 1}
+
+    test log-1.2 {every file of the install is there} -constraints dash -body {
+        set home [fresh home]
+        inst $home --user --no-path
+        set text [logOf $home]
+        lmap path [glob -directory [file join [data $home] lib] *] {
+            if {[actionOn $home $text lib/[file tail $path]] eq "add"} continue
+            set path
+        }
+    } -result {}
+
+    test log-2.1 {an upgrade says what happened to each file, and keeps what came before} -constraints dash -body {
+        set home [fresh home]
+        inst $home --user --no-path
+        set first [logOf $home]
+        tamper $home
+        set changed [file join [data $home] tclvenv.tcl]
+        file attributes $changed -permissions u+w
+        putText $changed "# changed\n"
+        inst $home --upgrade
+        set text [logOf $home]
+        list [string match "$first*" $text] [string match {* begin upgrade tclvenv *previous=*} $text] \
+            [actionOn $home [string range $text [string length $first] end] tclvenv.tcl] \
+            [actionOn $home [string range $text [string length $first] end] README.md] \
+            [actionOn $home [string range $text [string length $first] end] lib/stale.tcl] \
+            [string match "* end upgrade\n" $text]
+    } -result {1 1 update unchanged remove 1}
+
+    test log-2.2 {up to date adds nothing} -constraints dash -body {
+        set home [fresh home]
+        inst $home --user --no-path
+        set before [logOf $home]
+        inst $home --upgrade
+        expr {$before eq [logOf $home]}
+    } -result 1
+
+    test log-2.3 {a change to the log alone doesn't make an upgrade} -constraints dash -body {
+        set home [fresh home]
+        inst $home --user --no-path
+        putText [file join [data $home] .install-log] "note\n"
+        string match {*already up to date*} [lindex [inst $home --upgrade] 1]
+    } -result 1
+
+    test log-2.4 {a reinstall keeps it} -constraints dash -body {
+        set home [fresh home]
+        inst $home --user --no-path
+        inst $home --user --no-path
+        llength [regexp -all -inline -line { begin install } [logOf $home]]
+    } -result 2
+
+    test log-3.1 {a failure is on record} -constraints dash -body {
+        set home [fresh home]
+        inst $home --user --no-path
+        set tcl [fakeTcl [fresh fake] {[ $# -eq 0 ] && { echo 8.6.18; exit 0; }; exit 1}]
+        inst $home --upgrade --tcl $tcl
+        set text [logOf $home]
+        list [string match {* begin upgrade *} $text] [string match {* failed the new files don't run*} $text] \
+            [string match {* end upgrade*} $text]
+    } -result {1 1 0}
+
+    test log-3.2 {a failed move is on record, in the log kept} -constraints dash -body {
+        set home [fresh home]
+        inst $home --user --no-path
+        tamper $home
+        set stub [fresh stub]
+        set mv [putText [file join $stub mv] "#!/bin/sh\ncase \"\$2\" in *.tclvenv-install.*) exit 1;; esac\nexec /bin/mv \"\$@\"\n"]
+        file attributes $mv -permissions 0755
+        instWith [list PATH=$stub:$::installsh::basePath] $home --upgrade
+        string match {* failed could not put the new files*} [logOf $home]
+    } -result 1
+
+    test log-3.3 {--dry-run writes none} -constraints dash -body {
+        set home [fresh home]
+        set chosen [file join [fresh logs] my.log]
+        inst $home --user --no-path --dry-run --log $chosen
+        list [file exists [data $home]] [file exists $chosen]
+    } -result {0 0}
+
+    test log-4.1 {uninstall takes the install's own log} -constraints dash -body {
+        set home [fresh home]
+        inst $home --user --no-path
+        inst $home --uninstall
+        file exists [data $home]
+    } -result 0
+
+    test log-4.2 {--log also writes elsewhere, and uninstall leaves it, with what it removed} -constraints dash -body {
+        set home [fresh home]
+        set chosen [file join [fresh logs] sub my.log]
+        inst $home --user --path --log $chosen
+        set installed [getText $chosen]
+        inst $home --uninstall --log $chosen
+        set text [getText $chosen]
+        list [string match {* begin install *} $installed] \
+            [string match {* begin uninstall tclvenv *} $text] \
+            [string match "* remove [file join $home .local bin tclvenv]\n*" $text] \
+            [string match "* remove [data $home]/tclvenv.tcl\n*" $text] \
+            [string match "* path-remove [file join $home .profile]\n*" $text] \
+            [string match "* end uninstall\n" $text] [file exists [data $home]]
+    } -result {1 1 1 1 1 1 0}
+
+    test log-4.3 {a log that can't be written stops before anything is done} -constraints dash -body {
+        set home [fresh home]
+        set file [putText [file join [fresh logs] notdir] x]
+        lassign [inst $home --user --no-path --log [file join $file my.log]] status out err
+        list $status [string match {*log*} $err] [file exists [data $home]]
+    } -result {1 1 0}
+
+    test log-4.4 {uninstall on a command it leaves says so} -constraints dash -body {
+        set home [fresh home]
+        set chosen [file join [fresh logs] my.log]
+        putText [file join $home .local bin tclvenv] "#!/bin/sh\n"
+        inst $home --user --uninstall --log $chosen
+        string match "* leave [file join $home .local bin tclvenv] *" [getText $chosen]
+    } -result 1
+
+    variable program tclvenv
+    variable variable TCLVENV_TCLVENV
+    variable tool [file join $project tclvenv.tcl]
+    # (tclvenv's installer uses this checkout's tclvenv unless told otherwise.)
+    variable manager {}
+    testConstraint tclvenvBeside 1
+    # ---- install.sh --venv: the same tests in tclvenv and tclpkg ----
+    proc venvInst {home args} { variable manager; inst $home {*}$manager {*}$args }
+    proc manifestOf {home} { getText [file join [data $home] .install-manifest] }
+    proc commandOf {home} { variable program; file join $home .local bin $program }
+    proc venvOk {dir} { expr {[file isfile [file join $dir tclvenv.cfg]] && [file executable [file join $dir bin tclsh]]} }
+    # A stub that says its version and fails everything else.
+    proc badManager {} {
+        set path [putText [file join [fresh stub] tclvenv] "#!/bin/sh\n\[ \"\$1\" = --version \] && exit 0\necho nope >&2\nexit 1\n"]
+        file attributes $path -permissions 0755
+        return $path
+    }
+
+    test venv-1.1 {the command runs in a tclvenv inside its files} -constraints {dash tclvenvBeside} -body {
+        set home [fresh home]
+        lassign [venvInst $home --user --no-path --venv] status out
+        set vdir [file join [data $home] venv]
+        list $status [venvOk $vdir] [exec [commandOf $home] --version] \
+            [string match "*\ntcl $vdir/bin/tclsh\nvenv $vdir\nvenv-owned 1\n*" [manifestOf $home]] \
+            [string match "*Runs in the tclvenv: $vdir*" $out] \
+            [string match "*tcl='$vdir/bin/tclsh'*" [getText [commandOf $home]]]
+    } -match glob -result {0 1 * 1 1 1}
+
+    test venv-1.2 {an upgrade keeps it, and it isn't counted as the install's files} -constraints {dash tclvenvBeside} -body {
+        set home [fresh home]
+        venvInst $home --user --no-path --venv
+        set vdir [file join [data $home] venv]
+        set kept [putText [file join $vdir lib kept.txt] "mine\n"]
+        lassign [inst $home --upgrade] status1 out1
+        tamper $home
+        lassign [inst $home --upgrade] status2 out2
+        list $status1 [string match {*already up to date*} $out1] $status2 [string match {*Upgraded*} $out2] \
+            [file exists $kept] [file exists [file join [data $home] lib stale.tcl]] \
+            [catch {exec [commandOf $home] --version}] \
+            [string match "*\ntcl $vdir/bin/tclsh\nvenv $vdir\nvenv-owned 1\n*" [manifestOf $home]]
+    } -result {0 1 0 1 1 0 0 1}
+
+    test venv-1.3 {a directory elsewhere: made, and removed by uninstall} -constraints {dash tclvenvBeside} -body {
+        set home [fresh home]
+        set vdir [file join [fresh envs] deep er env]
+        lassign [venvInst $home --user --no-path --venv $vdir] status
+        set made [venvOk $vdir]
+        set before [catch {exec [commandOf $home] --version}]
+        lassign [inst $home --uninstall --user] status2 out
+        list $status $made $before $status2 [file exists $vdir] [file exists [data $home]] [string match "*Removed the tclvenv $vdir*" $out]
+    } -result {0 1 0 0 0 0 1}
+
+    test venv-1.4 {an existing tclvenv is used as it is, and stays after uninstall} -constraints {dash tclvenvBeside} -body {
+        variable tool
+        set home [fresh home]
+        set vdir [file join [fresh envs] env]
+        exec tclsh $tool create $vdir
+        set kept [putText [file join $vdir lib kept.txt] "mine\n"]
+        # (No tclvenv is needed to use one.)
+        lassign [inst $home --user --no-path --venv=$vdir --tclvenv /no/such] status
+        set works [catch {exec [commandOf $home] --version}]
+        lassign [inst $home --uninstall --user] status2 out
+        list $status $works $status2 [file exists $kept] [string match "*Left the tclvenv $vdir*" $out]
+    } -result {0 0 0 1 1}
+
+    test venv-1.5 {DIR is optional, and the variable names the tclvenv} -constraints {dash tclvenvBeside} -body {
+        variable tool
+        variable variable
+        set home [fresh home]
+        lassign [instWith [list $variable=$tool] $home --venv --user --no-path] status
+        list $status [venvOk [file join [data $home] venv]]
+    } -result {0 1}
+
+    test venv-1.6 {an upgrade can add one} -constraints {dash tclvenvBeside} -body {
+        set home [fresh home]
+        inst $home --user --no-path
+        lassign [venvInst $home --upgrade --venv] status out
+        list $status [venvOk [file join [data $home] venv]] [catch {exec [commandOf $home] --version}]
+    } -result {0 1 0}
+
+    test venv-1.7 {one that has gone is made again} -constraints {dash tclvenvBeside} -body {
+        set home [fresh home]
+        venvInst $home --user --no-path --venv
+        set vdir [file join [data $home] venv]
+        file delete -force $vdir
+        lassign [venvInst $home --upgrade] status
+        list $status [venvOk $vdir] [catch {exec [commandOf $home] --version}]
+    } -result {0 1 0}
+
+    test venv-1.8 {the command sees the caller's settings, not its environment's} -constraints {dash tclvenvBeside} -body {
+        variable program
+        set home [fresh home]
+        venvInst $home --user --no-path --venv
+        # Keep the entry point's start, which puts them back, and show the result.
+        set entry [file join [data $home] $program.tcl]
+        set text [getText $entry]
+        set end [string first "unset ::installSaved\n\}\n" $text]
+        putText $entry "[string range $text 0 [expr {$end + 22}]]puts \[array get env INSTALL_SH*\]\nputs \[array get env TCLVENV\]\nputs \[array get env PATH\]\nputs \[array get env TCLLIBPATH\]\n"
+        set a [split [exec env -i HOME=$home PATH=/usr/bin:/bin [commandOf $home]] \n]
+        set b [split [exec env -i HOME=$home PATH=/bin TCLVENV=/mine TCLLIBPATH=/lib1 [commandOf $home]] \n]
+        list $a $b
+    } -result {{{} {} {PATH /usr/bin:/bin} {}} {{} {TCLVENV /mine} {PATH /bin} {TCLLIBPATH /lib1}}}
+
+    test venv-2.1 {a directory that isn't a tclvenv is refused} -constraints {dash tclvenvBeside} -body {
+        set home [fresh home]
+        set vdir [fresh notenv]
+        lassign [venvInst $home --user --no-path --venv $vdir] status out err
+        list $status [string match {*isn't a usable tclvenv*} $err] [file exists [data $home]] [glob -nocomplain -directory $vdir *]
+    } -result {1 1 0 {}}
+
+    test venv-2.2 {no tclvenv to make it with} -constraints dash -body {
+        set home [fresh home]
+        lassign [inst $home --user --no-path --venv --tclvenv /no/such/tclvenv] status out err
+        list $status [string match {*needs a working tclvenv*} $err] [file exists [data $home]] [file exists [commandOf $home]]
+    } -result {1 1 0 0}
+
+    test venv-2.3 {failing to make it leaves nothing, and keeps an install there} -constraints dash -body {
+        set home [fresh home]
+        lassign [inst $home --user --no-path --venv --tclvenv [badManager]] status out err
+        set fresh [list $status [string match {*could not create*} $err] [file exists [data $home]] \
+            [glob -nocomplain -tails -directory [file dirname [data $home]] .*-install.*]]
+        inst $home --user --no-path
+        tamper $home
+        lassign [inst $home --upgrade --venv --tclvenv [badManager]] status
+        list {*}$fresh $status [file exists [file join [data $home] lib stale.tcl]] [file exists [file join [data $home] venv]] \
+            [catch {exec [commandOf $home] --version}]
+    } -result {1 1 0 {} 1 1 0 0}
+
+    test venv-2.4 {an install's tclvenv isn't swapped for another} -constraints {dash tclvenvBeside} -body {
+        set home [fresh home]
+        venvInst $home --user --no-path --venv
+        lassign [venvInst $home --user --no-path --venv [file join [fresh envs] other]] status out err
+        list $status [string match {*uninstall it first*} $err]
+    } -result {1 1}
+
+    foreach {n place message} {1 lib {own files} 2 a/b {directly inside} 3 . {files directory}} {
+        test venv-2.5.$n "not at $place in the files directory" -constraints {dash tclvenvBeside} -body {
+            set home [fresh home]
+            lassign [venvInst $home --user --no-path --venv [file join [data $home] $place]] status out err
+            list $status [string match "*$message*" $err] [file exists [data $home]]
+        } -result {1 1 0}
+    }
+
+    test venv-2.6 {the command doesn't go inside it} -constraints {dash tclvenvBeside} -body {
+        set home [fresh home]
+        set vdir [file join [fresh envs] env]
+        lassign [venvInst $home --bindir [file join $vdir bin] --user --no-path --venv $vdir] status out err
+        list $status [string match {*can't be inside the tclvenv*} $err] [file exists $vdir]
+    } -result {1 1 0}
+
+    test venv-2.7 {--tcl is reported as ignored for one already there} -constraints {dash tclvenvBeside} -body {
+        set home [fresh home]
+        venvInst $home --user --no-path --venv
+        lassign [venvInst $home --upgrade --force --tcl /usr/bin/tclsh] status out err
+        list $status [string match {*ignoring --tcl*} $err] [string match "*\ntcl [file join [data $home] venv bin tclsh]\n*" [manifestOf $home]]
+    } -result {0 1 1}
+
+    test venv-3.1 {--dry-run makes nothing} -constraints {dash tclvenvBeside} -body {
+        set home [fresh home]
+        set vdir [file join $home env]
+        lassign [venvInst $home --user --no-path --venv $vdir --dry-run] status out
+        list $status [string match "*would create a tclvenv at $vdir with *" $out] [string match "*Dry run: nothing was changed.\n" $out] [tree $home]
+    } -result {0 1 1 {}}
+
+    test venv-3.2 {--dry-run on one there says so} -constraints {dash tclvenvBeside} -body {
+        set home [fresh home]
+        venvInst $home --user --no-path --venv
+        tamper $home
+        set before [tree $home]
+        lassign [inst $home --upgrade --dry-run] status out
+        list $status [string match {*would use the tclvenv at*} $out] [expr {$before eq [tree $home]}]
+    } -result {0 1 1}
+
+    test venv-3.3 {--dry-run of uninstall removes nothing and says what it would} -constraints {dash tclvenvBeside} -body {
+        set home [fresh home]
+        set vdir [file join [fresh envs] env]
+        venvInst $home --user --no-path --venv $vdir
+        set before [tree $home]
+        lassign [inst $home --uninstall --user --dry-run] status out
+        list $status [string match "*would remove the tclvenv $vdir*" $out] [string match "*would remove [commandOf $home]*" $out] \
+            [string match "*Dry run: nothing was changed.\n" $out] [string match {*is uninstalled*} $out] \
+            [expr {$before eq [tree $home]}] [venvOk $vdir]
+    } -result {0 1 1 1 0 1 1}
+
+    test venv-3.4 {uninstall leaves what no longer looks like a tclvenv} -constraints {dash tclvenvBeside} -body {
+        set home [fresh home]
+        set vdir [file join [fresh envs] env]
+        venvInst $home --user --no-path --venv $vdir
+        file delete [file join $vdir tclvenv.cfg]
+        lassign [inst $home --uninstall --user] status out
+        list $status [file isdirectory $vdir] [string match {*it is not a tclvenv*} $out]
+    } -result {0 1 1}
+
+    test dry-run-1 {a plain --dry-run says what it would do, and that it did nothing} -constraints dash -body {
+        variable program
+        set home [fresh home]
+        lassign [inst $home --user --path --dry-run] status out
+        list $status [string match "*would write [commandOf $home]\n*" $out] [string match "*would write [data $home]/.install-manifest\n*" $out] \
+            [string match "*Dry run: nothing was changed.\n" $out] [tree $home]
+    } -result {0 1 1 1 {}}
+
     cleanupTests
 }
 namespace delete ::installsh

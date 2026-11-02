@@ -9,7 +9,7 @@ namespace eval ::shells {
     variable work [makeDirectory "shells-[pid]"]
     variable count 0
     testConstraint unix [expr {$::tcl_platform(platform) eq "unix"}]
-    foreach shell {dash bash busybox python3} {
+    foreach shell {dash bash zsh ksh busybox python3} {
         testConstraint $shell [expr {$::tcl_platform(platform) eq "unix" && [auto_execok $shell] ne ""}]
     }
 
@@ -150,6 +150,38 @@ namespace eval ::shells {
         set script {. "$1/bin/activate"; deactivate; command -v deactivate || echo gone}
         run [file dirname $environment] "" dash -c $script sh $environment
     } -result [list 0 "gone\n" {}]
+    # bash's command -v reports the non-executable bin/deactivate; dash's doesn't.
+    foreach shell {dash bash zsh ksh} {
+        test deactivate-3.file-$shell {sourcing bin/deactivate leaves the environment} -constraints $shell -body {
+            set environment [newEnvironment]
+            set script {P0=$PATH; PS1='> '; . "$1/bin/activate"; . "$1/bin/deactivate"
+                [ "$PATH" = "$P0" ] && echo restored; echo "${TCLVENV-unset}|$PS1"
+                command -v tclvenv_deactivate || echo gone; command -v deactivate || echo gone}
+            run [file dirname $environment] "" $shell -c $script sh $environment
+        } -result [list 0 "restored\nunset|> \ngone\ngone\n" {}]
+        test deactivate-3.file-inactive-$shell {sourcing bin/deactivate with nothing active only says so} -constraints $shell -body {
+            set environment [newEnvironment]
+            set script {P0=$PATH; . "$1/bin/deactivate"; echo "status=$?"; [ "$PATH" = "$P0" ] && echo same}
+            run [file dirname $environment] "" $shell -c $script sh $environment
+        } -result [list 0 "status=0\nsame\n" "tclvenv: no environment was activated in this shell\n"]
+        # A child shell inherits PATH with bin/ on it, but not the function.
+        test deactivate-3.file-on-path-$shell {bin/deactivate on PATH does not count as another tool} -constraints $shell -body {
+            set environment [newEnvironment]
+            set script {PATH="$1/bin:$PATH"; . "$1/bin/activate"; deactivate; echo "${_TCLVENV_FOUND-unset}"}
+            run [file dirname $environment] "" $shell -c $script sh $environment
+        } -result [list 0 "unset\n" {}]
+        test deactivate-3.executable-$shell {an executable deactivate on PATH is still another tool's} -constraints $shell -body {
+            set environment [newEnvironment]
+            set tool [fresh]
+            putText [file join $tool deactivate] "#!/bin/sh\necho theirs\n"
+            file attributes [file join $tool deactivate] -permissions 0755
+            set script {PATH="$2:$PATH"; . "$1/bin/activate"; tclvenv_deactivate; deactivate}
+            run [file dirname $environment] "" $shell -c $script sh $environment $tool
+        } -result [list 0 "theirs\n" "tclvenv: deactivate belongs to another tool here; leave this environment with tclvenv_deactivate\n"]
+    }
+    test deactivate-3.file-mode {bin/deactivate is not executable} -constraints unix -body {
+        file executable [file join [newEnvironment] bin deactivate]
+    } -result 0
     proc pythonVenv {} {
         set directory [fresh]
         lassign [run $directory "" python3 -m venv pyv] status
@@ -175,6 +207,15 @@ namespace eval ::shells {
             tclvenv_deactivate; echo "tclvenv=${TCLVENV-unset}"; [ "$PATH" = "$P0" ] && echo restored}
         lrange [run [file dirname $environment] "" bash --norc --noprofile -c $script sh $environment $python] 0 1
     } -result [list 0 "active=env\nvenv=unset\ntclvenv=unset\nrestored\n"]
+    # Python's deactivate removes the name, and zsh's unset -f complains then.
+    test deactivate-3.python-outside-zsh {zsh leaves both quietly, even under set -e} -constraints {zsh python3} -body {
+        set environment [newEnvironment]
+        set python [pythonVenv]
+        if {$python eq ""} { return skipped }
+        set script {set -e; P0=$PATH; . "$1/bin/activate"; . "$2/bin/activate"
+            deactivate; tclvenv_deactivate; echo "tclvenv=${TCLVENV-unset}"; [ "$PATH" = "$P0" ] && echo restored}
+        run [file dirname $environment] "" zsh -f -c $script sh $environment $python
+    } -result [list 0 "tclvenv=unset\nrestored\n" {}]
 
     # 4. Export status is restored.
     test export-4.unexported {an unexported TCLVENV stays unexported} -constraints dash -body {

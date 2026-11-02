@@ -41,7 +41,8 @@ tclvenv --version
 ```
 
 `sh install.sh --user` installs without asking, and `sudo sh install.sh
---system` installs for every user. `sh install.sh --uninstall` removes it
+--system` installs for every user. `sh install.sh --upgrade` updates an install
+from a newer checkout, keeping its place and settings. `sh install.sh --uninstall` removes it
 again. You need Tcl 8.6 or newer (`sudo apt install tcl`, or `tcl9.0`,
 on Debian and Ubuntu). The README's [Install](../README.md#install)
 section lists every option.
@@ -213,6 +214,11 @@ While it is active, `TCLVENV` holds the environment's path, and the prompt
 starts with `(.venv)`. `deactivate` restores `PATH`, `TCLVENV` and the
 prompt exactly as they were. Sourcing another environment's `activate`
 switches to that environment.
+
+`deactivate` is a shell function that `activate` defines, because a separate
+program can't change your shell. `. .venv/bin/deactivate` does the same thing
+from a file. The file only works in the shell that ran `activate`: a child
+shell inherits `PATH` and `TCLVENV` but not the saved state, so just `exit` it.
 
 **Together with a Python venv.** Both define `deactivate`. If one already
 exists when you activate, tclvenv leaves it alone and says so. Leave the
@@ -725,6 +731,7 @@ tclvenv install ENV SOURCE [--sha256 HEX] [--subdir PATH] [--deps|--no-deps]
             or an http(s) URL of one (with --sha256)
 tclvenv add ENV PACKAGE [VERSION] [--path DIR ...] [--no-deps] [--no-check]
 tclvenv available ENV [PATTERN] [--path DIR ...]
+tclvenv export ENV [--output FILE]
 tclvenv remove ENV ID [--discard-changes]
 tclvenv recover ENV
 tclvenv --version | --help
